@@ -1,4 +1,5 @@
 import taskbench.envs.bin_with_objects  # noqa: F401 — triggers env registration
+import taskbench.envs.open_table_push  # noqa: F401 — triggers env registration
 import taskbench.envs.shelf_env  # noqa: F401 — triggers env registration
 import taskbench.envs.stack_cube_distractor  # noqa: F401 — triggers env registration
 import taskbench.envs.stack_n_cube  # noqa: F401 — triggers env registration

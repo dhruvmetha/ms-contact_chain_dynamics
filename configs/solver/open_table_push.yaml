@@ -1,0 +1,44 @@
+# @package _global_
+run:
+  solver: open_table_push
+  num_episodes: 1
+  solver_kwargs:
+    clearance_height: 0.0
+    lift_height: 0.0
+    effort_scale: 0.25
+    effort_scale_end: 0.75
+    min_contact_force: 0.01
+    staging_speed_scale: 1.0
+    hover_speed_scale: 1.0
+    approach_speed_scale: 1.0
+    push_speed_scale: 1.0
+    settle_steps: 8
+env:
+  env_id: OpenTablePush-v1
+  control_mode: pd_joint_pos
+  num_envs: 1
+  max_episode_steps: 320
+  reward_mode: none
+  record_video: true
+  render_mode: rgb_array
+  extra_kwargs:
+    robot_uids: panda
+    push_axis: y
+    push_angle_deg: 90.0
+    wrist_orientation: vertical
+    tool_spin_deg: 0.0
+    object_kind: bottle
+    object_density: 1800.0
+    use_staging: true
+    num_cylinders: 2
+    row_x: 0.20
+    row_start_y: -0.03
+    row_origin_x: 0.16
+    row_origin_y: -0.06
+    row_spacing: 0.05
+    success_displacement: 0.04
+    table_clearance: 0.006
+    push_height_offset: 0.0
+    approach_gap: 0.06
+    staging_height: 0.18
+    staging_backoff: 0.0

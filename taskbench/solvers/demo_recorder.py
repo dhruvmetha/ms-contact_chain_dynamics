@@ -170,7 +170,7 @@ class DemoRecorderSolver(BaseSolver):
                     else:
                         print(f"[pick] Failed: {result.failure_reason}")
                     program_steps.append({
-                        "skill": "pick", "args": {"obj": cube_name},
+                        "skill": "pick", "args": {"obj_name": cube_name},
                         "success": result.success,
                     })
 
@@ -198,9 +198,13 @@ class DemoRecorderSolver(BaseSolver):
                         print(f"[place] OK")
                     else:
                         print(f"[place] Failed: {result.failure_reason}")
+                    place_args = {
+                        "target_pose": [release_p.tolist(), release_q.tolist()],
+                        "retract_height": float(pick_result.lift_pose.p[2]),
+                    }
                     held_cube = None
                     program_steps.append({
-                        "skill": "place", "args": {"target": target_name},
+                        "skill": "place", "args": place_args,
                         "success": result.success,
                     })
 
@@ -253,14 +257,44 @@ class DemoRecorderSolver(BaseSolver):
                         (push_end_pos, push_end_quat),
                     )
                     if result.success:
-                        print("[push] OK")
+                        print(
+                            "[push] OK "
+                            f"(xy={result.planar_push_distance:.3f} m, "
+                            f"cmd_force_limit={result.arm_force_limit_mean:.2f}, "
+                            f"peak_contact={result.contact_force_peak:.2f} N, "
+                            f"peak_joint_load={result.joint_load_l2_peak:.2f})"
+                        )
                     else:
                         print(f"[push] Failed: {result.failure_reason}")
                     program_steps.append({
                         "skill": "push",
                         "args": {
-                            "start_pose": push_start_pos.tolist(),
-                            "end_pose": push_end_pos.tolist(),
+                            "approach_pose": [
+                                push_start_pos.tolist(),
+                                push_start_quat.tolist(),
+                            ],
+                            "push_pose": [
+                                push_end_pos.tolist(),
+                                push_end_quat.tolist(),
+                            ],
+                        },
+                        "metrics": {
+                            "push_distance": result.push_distance,
+                            "planar_push_distance": result.planar_push_distance,
+                            "effort_scale_start": result.effort_scale_start,
+                            "effort_scale_end": result.effort_scale_end,
+                            "arm_force_limit_start": result.arm_force_limit_start,
+                            "arm_force_limit_end": result.arm_force_limit_end,
+                            "arm_force_limit_peak": result.arm_force_limit_peak,
+                            "arm_force_limit_mean": result.arm_force_limit_mean,
+                            "contact_steps": result.contact_steps,
+                            "contact_force_peak": result.contact_force_peak,
+                            "contact_force_mean": result.contact_force_mean,
+                            "joint_effort_l2_peak": result.joint_effort_l2_peak,
+                            "joint_effort_l2_mean": result.joint_effort_l2_mean,
+                            "joint_load_l2_peak": result.joint_load_l2_peak,
+                            "joint_load_l2_mean": result.joint_load_l2_mean,
+                            "contact_objects": list(result.contact_objects),
                         },
                         "success": result.success,
                     })

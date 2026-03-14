@@ -45,7 +45,16 @@ class StackCubesSolver(BaseSolver):
         recorder = StateRecorder(
             env,
             objects=objects,
-            robot_fields=["qpos", "tcp_pos", "tcp_quat", "gripper_qpos"],
+            robot_fields=[
+                "qpos",
+                "qf",
+                "arm_force_limit",
+                "joint_load_l2",
+                "tcp_pos",
+                "tcp_quat",
+                "gripper_qpos",
+                "gripper_contact_force",
+            ],
         )
         ctx.step_callback = recorder.record
         ctx._build_skills()

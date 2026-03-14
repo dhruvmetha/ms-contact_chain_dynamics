@@ -12,7 +12,7 @@ Eliminates the boilerplate that every solver repeats::
 from typing import Callable, Optional
 
 from taskbench.envs import get_objects
-from taskbench.skills.motion import setup_planner
+from taskbench.skills.motion import make_linear_push_plan, setup_planner
 from taskbench.skills.primitives import Move, Pick, Place, Push
 from taskbench.skills.robot_config import RobotConfig, get_robot_config
 
@@ -74,3 +74,12 @@ class SkillContext:
         self.place = Place(self.env, self.planner, **kw)
         self.push = Push(self.env, self.planner, **kw)
         self.move = Move(self.env, self.planner, **kw)
+
+    def plan_linear_push(self, **kwargs):
+        """Build a Cartesian push plan from task-space parameters.
+
+        This is the preferred interface for push setup: define where contact
+        starts, which direction to push, how far to push, and the tool
+        orientation. The low-level planner handles joint-space realization.
+        """
+        return make_linear_push_plan(self.env.unwrapped.agent, **kwargs)

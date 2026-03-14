@@ -29,7 +29,9 @@ from taskbench.skills.motion import (
     actuate_gripper,
     attach_object,
     detach_object,
+    get_arm_drive_settings,
     move_to_pose,
+    set_arm_drive_settings,
     to_sapien_pose,
 )
 from taskbench.skills.robot_config import RobotConfig, get_robot_config
@@ -51,7 +53,9 @@ class SkillResult:
 
 @dataclass
 class MoveResult(SkillResult):
-    pass
+    contact_link: Optional[str] = None
+    contact_entity: Optional[str] = None
+    contact_force: float = 0.0
 
 
 @dataclass
@@ -68,7 +72,24 @@ class PlaceResult(SkillResult):
 
 @dataclass
 class PushResult(SkillResult):
-    pass
+    approach_pose: Optional[sapien.Pose] = None
+    push_pose: Optional[sapien.Pose] = None
+    push_distance: float = 0.0
+    planar_push_distance: float = 0.0
+    effort_scale_start: float = 1.0
+    effort_scale_end: float = 1.0
+    arm_force_limit_start: float = 0.0
+    arm_force_limit_end: float = 0.0
+    arm_force_limit_peak: float = 0.0
+    arm_force_limit_mean: float = 0.0
+    contact_steps: int = 0
+    contact_force_peak: float = 0.0
+    contact_force_mean: float = 0.0
+    joint_effort_l2_peak: float = 0.0
+    joint_effort_l2_mean: float = 0.0
+    joint_load_l2_peak: float = 0.0
+    joint_load_l2_mean: float = 0.0
+    contact_objects: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -116,18 +137,45 @@ class Move(Skill):
         target_pose: PoseLike to move the end effector to.
         gripper_open: Gripper state during motion (default True).
         monitor_contacts: Abort on collision during execution (default True).
+        allowed_contact_links: Optional set of robot link names allowed to
+            touch external objects during this motion. Typical use is to
+            allow only the pusher links during a push phase.
+        time_step_scale: Multiplier on the planner/control waypoint spacing.
+            Values > 1 execute faster with fewer waypoints.
+        refine_steps: Number of extra hold steps at the end of the move to
+            let the controller settle at the final target.
+        contact_force_threshold: Minimum contact magnitude treated as a
+            collision when ``monitor_contacts=True``.
     """
 
     def __call__(self, target_pose: PoseLike, *, gripper_open=True,
-                 monitor_contacts=True) -> MoveResult:
+                 monitor_contacts=True, diagnostics=None,
+                 allowed_contact_links=None, control_hook=None,
+                 time_step_scale=1.0,
+                 refine_steps=0,
+                 contact_force_threshold=0.01) -> MoveResult:
         target_pose = to_sapien_pose(target_pose)
         rc = self.robot_config
         gripper_state = rc.gripper_open if gripper_open else rc.gripper_closed
+        local_diagnostics = diagnostics if diagnostics is not None else {}
         res = move_to_pose(self.env, self.planner, target_pose, gripper_state,
                            rc, monitor_contacts=monitor_contacts,
-                           step_callback=self.step_callback)
+                           diagnostics=local_diagnostics,
+                           allowed_contact_links=allowed_contact_links,
+                           control_hook=control_hook,
+                           step_callback=self.step_callback,
+                           time_step_scale=time_step_scale,
+                           refine_steps=refine_steps,
+                           contact_force_threshold=contact_force_threshold)
         if res is None:
-            return MoveResult(success=False, failure_reason="move_plan_failed")
+            failure_reason = local_diagnostics.get("failure_reason", "move_plan_failed")
+            return MoveResult(
+                success=False,
+                failure_reason=failure_reason,
+                contact_link=local_diagnostics.get("collision_link"),
+                contact_entity=local_diagnostics.get("collision_entity"),
+                contact_force=float(local_diagnostics.get("collision_force", 0.0)),
+            )
         return MoveResult(success=True, step_result=res)
 
 
@@ -293,59 +341,278 @@ class Push(Skill):
     """Lift for clearance, close gripper, approach, sweep, lift, open.
 
     Args (at call time):
+        staging_pose: Optional pre-push pose. Useful for vertical pushes that
+            stage above the contact point before descending.
+        hover_pose: Optional pre-descent pose directly above the approach pose.
+            Useful when you want a smooth vertical lowering phase with more
+            clearance around nearby objects.
         approach_pose: PoseLike to move to before pushing (no contact).
-        push_pose: PoseLike to sweep toward (contact expected).
+        push_pose: PoseLike to sweep toward using a straight-line Cartesian
+            motion (contact expected).
         clearance_height: Height to lift above current position before
             approaching (default 0.1m).
         lift_height: Height to lift above push_pose after pushing (default 0.1m).
+        effort_scale: Scalar multiplier on the arm's current drive force limit
+            during the push sweep.
+        effort_scale_end: Optional end multiplier for a linear ramp across the
+            push sweep. If omitted, the commanded effort stays constant.
+        min_contact_force: Optional minimum peak contact force (N) required
+            for the push to count as successful.
+        *_speed_scale: Optional planner/control waypoint spacing multipliers
+            for each phase. Values > 1 run faster with fewer waypoints.
     """
 
     def __call__(self, approach_pose: PoseLike, push_pose: PoseLike, *,
-                 clearance_height=0.1, lift_height=0.1) -> PushResult:
+                 staging_pose: PoseLike | None = None,
+                 hover_pose: PoseLike | None = None,
+                 clearance_height=0.1, lift_height=0.1,
+                 effort_scale=1.0, effort_scale_end=None,
+                 min_contact_force=0.0,
+                 open_gripper_after_push=True,
+                 staging_speed_scale=1.0,
+                 hover_speed_scale=1.0,
+                 clearance_speed_scale=1.0,
+                 approach_speed_scale=1.0,
+                 push_speed_scale=1.0,
+                 lift_speed_scale=1.0) -> PushResult:
+        if staging_pose is not None:
+            staging_pose = to_sapien_pose(staging_pose)
+        if hover_pose is not None:
+            hover_pose = to_sapien_pose(hover_pose)
         approach_pose = to_sapien_pose(approach_pose)
         push_pose = to_sapien_pose(push_pose)
         env, planner, rc = self.env, self.planner, self.robot_config
         raw = env.unwrapped
         move = Move(env, planner, robot_config=rc, step_callback=self.step_callback)
+        if effort_scale_end is None:
+            effort_scale_end = effort_scale
+        effort_scale = float(effort_scale)
+        effort_scale_end = float(effort_scale_end)
+        if effort_scale <= 0 or effort_scale_end <= 0:
+            return PushResult(success=False, failure_reason="invalid_effort_scale")
+        approach_p = np.asarray(approach_pose.p, dtype=np.float64).flatten()[:3]
+        push_p = np.asarray(push_pose.p, dtype=np.float64).flatten()[:3]
+        push_delta = push_p - approach_p
+        push_distance = float(np.linalg.norm(push_delta))
+        planar_push_distance = float(np.linalg.norm(push_delta[:2]))
+        base_drive = get_arm_drive_settings(env)
+        if base_drive is None:
+            return PushResult(
+                success=False,
+                failure_reason="arm_controller_unavailable",
+                approach_pose=approach_pose,
+                push_pose=push_pose,
+                push_distance=push_distance,
+                planar_push_distance=planar_push_distance,
+            )
+        arm_force_limit_start = base_drive["force_limit"] * effort_scale
+        arm_force_limit_end = base_drive["force_limit"] * effort_scale_end
 
-        # Lift from current position for clearance
-        tcp_pose = raw.agent.tcp.pose
-        tcp_p = np.asarray(tcp_pose.p, dtype=np.float64).flatten()[:3]
-        tcp_q = np.asarray(tcp_pose.q, dtype=np.float32).flatten()[:4]
-        clearance_pose = sapien.Pose(
-            np.array([tcp_p[0], tcp_p[1], tcp_p[2] + clearance_height],
-                     dtype=np.float32),
-            tcp_q,
-        )
-        result = move(clearance_pose)
-        if not result.success:
-            return PushResult(success=False, failure_reason="clearance_lift_failed")
+        # Optional pre-stage. Useful for vertical pushes that should descend
+        # straight down to the contact start pose.
+        if staging_pose is not None:
+            result = move(
+                staging_pose,
+                gripper_open=False,
+                time_step_scale=staging_speed_scale,
+            )
+            if not result.success:
+                return PushResult(
+                    success=False,
+                    failure_reason="staging_move_failed",
+                    approach_pose=approach_pose,
+                    push_pose=push_pose,
+                    push_distance=push_distance,
+                    planar_push_distance=planar_push_distance,
+                    effort_scale_start=effort_scale,
+                    effort_scale_end=effort_scale_end,
+                    arm_force_limit_start=arm_force_limit_start,
+                    arm_force_limit_end=arm_force_limit_end,
+                )
 
-        # Close gripper for flat push surface
+        if hover_pose is not None:
+            result = move(
+                hover_pose,
+                gripper_open=False,
+                time_step_scale=hover_speed_scale,
+            )
+            if not result.success:
+                return PushResult(
+                    success=False,
+                    failure_reason="hover_move_failed",
+                    approach_pose=approach_pose,
+                    push_pose=push_pose,
+                    push_distance=push_distance,
+                    planar_push_distance=planar_push_distance,
+                    effort_scale_start=effort_scale,
+                    effort_scale_end=effort_scale_end,
+                    arm_force_limit_start=arm_force_limit_start,
+                    arm_force_limit_end=arm_force_limit_end,
+                )
+
+        # Lift from current position for clearance when requested.
+        if clearance_height > 0:
+            tcp_pose = raw.agent.tcp.pose
+            tcp_p = np.asarray(tcp_pose.p, dtype=np.float64).flatten()[:3]
+            tcp_q = np.asarray(tcp_pose.q, dtype=np.float32).flatten()[:4]
+            clearance_pose = sapien.Pose(
+                np.array([tcp_p[0], tcp_p[1], tcp_p[2] + clearance_height],
+                         dtype=np.float32),
+                tcp_q,
+            )
+            result = move(clearance_pose, time_step_scale=clearance_speed_scale)
+            if not result.success:
+                return PushResult(
+                    success=False,
+                    failure_reason="clearance_lift_failed",
+                    approach_pose=approach_pose,
+                    push_pose=push_pose,
+                    push_distance=push_distance,
+                    planar_push_distance=planar_push_distance,
+                    effort_scale_start=effort_scale,
+                    effort_scale_end=effort_scale_end,
+                    arm_force_limit_start=arm_force_limit_start,
+                    arm_force_limit_end=arm_force_limit_end,
+                )
+
+        # Close gripper for the actual push surface after free-space transit.
         actuate_gripper(env, planner, rc.gripper_closed,
                         step_callback=self.step_callback)
 
         # Approach — closed gripper, contact monitoring on
-        result = move(approach_pose, gripper_open=False)
+        result = move(
+            approach_pose,
+            gripper_open=False,
+            time_step_scale=approach_speed_scale,
+        )
         if not result.success:
-            return PushResult(success=False, failure_reason="approach_failed")
+            return PushResult(
+                success=False,
+                failure_reason="approach_failed",
+                approach_pose=approach_pose,
+                push_pose=push_pose,
+                push_distance=push_distance,
+                planar_push_distance=planar_push_distance,
+                effort_scale_start=effort_scale,
+                effort_scale_end=effort_scale_end,
+                arm_force_limit_start=arm_force_limit_start,
+                arm_force_limit_end=arm_force_limit_end,
+            )
 
         # Sweep — closed gripper, contact monitoring off (contact is intentional)
-        result = move(push_pose, gripper_open=False, monitor_contacts=False)
-        if not result.success:
-            return PushResult(success=False, failure_reason="push_failed")
+        diagnostics = {}
+        def _push_effort_hook(progress, _idx, _num_steps):
+            force_limit = arm_force_limit_start + (
+                arm_force_limit_end - arm_force_limit_start
+            ) * progress
+            diagnostics.setdefault("commanded_force_limit_samples", []).append(
+                float(force_limit)
+            )
+            set_arm_drive_settings(env, force_limit=force_limit)
 
-        # Lift to disengage — gripper stays closed to avoid snagging
-        post_lift_pose = sapien.Pose(
-            [push_pose.p[0], push_pose.p[1], push_pose.p[2] + lift_height],
-            push_pose.q,
+        try:
+            result = move(
+                push_pose,
+                gripper_open=False,
+                monitor_contacts=True,
+                allowed_contact_links=rc.gripper_link_names,
+                diagnostics=diagnostics,
+                control_hook=_push_effort_hook,
+                time_step_scale=push_speed_scale,
+            )
+        finally:
+            set_arm_drive_settings(
+                env,
+                stiffness=base_drive["stiffness"],
+                damping=base_drive["damping"],
+                force_limit=base_drive["force_limit"],
+            )
+        if not result.success:
+            return PushResult(
+                success=False,
+                failure_reason="push_failed",
+                approach_pose=approach_pose,
+                push_pose=push_pose,
+                push_distance=push_distance,
+                planar_push_distance=planar_push_distance,
+                effort_scale_start=effort_scale,
+                effort_scale_end=effort_scale_end,
+                arm_force_limit_start=arm_force_limit_start,
+                arm_force_limit_end=arm_force_limit_end,
+            )
+
+        # Lift to disengage when requested — gripper stays closed to avoid snagging.
+        if lift_height > 0:
+            post_lift_pose = sapien.Pose(
+                [push_pose.p[0], push_pose.p[1], push_pose.p[2] + lift_height],
+                push_pose.q,
+            )
+            result = move(
+                post_lift_pose,
+                gripper_open=False,
+                monitor_contacts=False,
+                time_step_scale=lift_speed_scale,
+            )
+            if not result.success:
+                logger.warning("Push lift failed, continuing anyway")
+
+        # Opening after a push is optional. Keeping the pusher geometry fixed
+        # avoids end-of-demo chatter when the hand is still parked near objects.
+        if open_gripper_after_push:
+            actuate_gripper(env, planner, rc.gripper_open,
+                            step_callback=self.step_callback)
+
+        contact_force_samples = diagnostics.get("contact_force_samples", [])
+        commanded_force_limit_samples = diagnostics.get(
+            "commanded_force_limit_samples", []
         )
-        result = move(post_lift_pose, gripper_open=False)
-        if not result.success:
-            logger.warning("Push lift failed, continuing anyway")
+        nonzero_contact_forces = [f for f in contact_force_samples if f > 0]
+        joint_effort_l2_samples = diagnostics.get("joint_effort_l2_samples", [])
+        joint_load_l2_samples = diagnostics.get("joint_load_l2_samples", [])
+        contact_force_peak = max(contact_force_samples, default=0.0)
+        contact_force_mean = (
+            float(np.mean(nonzero_contact_forces)) if nonzero_contact_forces else 0.0
+        )
+        joint_effort_l2_peak = max(joint_effort_l2_samples, default=0.0)
+        joint_effort_l2_mean = (
+            float(np.mean(joint_effort_l2_samples))
+            if joint_effort_l2_samples else 0.0
+        )
+        joint_load_l2_peak = max(joint_load_l2_samples, default=0.0)
+        joint_load_l2_mean = (
+            float(np.mean(joint_load_l2_samples))
+            if joint_load_l2_samples else 0.0
+        )
+        contact_objects = tuple(sorted(diagnostics.get("contact_entities", ())))
+        contact_steps = len(nonzero_contact_forces)
+        success = contact_force_peak >= float(min_contact_force)
+        failure_reason = None
+        if not success:
+            failure_reason = "insufficient_contact_force"
 
-        # Open gripper once clear
-        actuate_gripper(env, planner, rc.gripper_open,
-                        step_callback=self.step_callback)
-
-        return PushResult(success=True, step_result=result.step_result)
+        return PushResult(
+            success=success,
+            failure_reason=failure_reason,
+            step_result=result.step_result,
+            approach_pose=approach_pose,
+            push_pose=push_pose,
+            push_distance=push_distance,
+            planar_push_distance=planar_push_distance,
+            effort_scale_start=effort_scale,
+            effort_scale_end=effort_scale_end,
+            arm_force_limit_start=arm_force_limit_start,
+            arm_force_limit_end=arm_force_limit_end,
+            arm_force_limit_peak=max(commanded_force_limit_samples, default=0.0),
+            arm_force_limit_mean=(
+                float(np.mean(commanded_force_limit_samples))
+                if commanded_force_limit_samples else 0.0
+            ),
+            contact_steps=contact_steps,
+            contact_force_peak=contact_force_peak,
+            contact_force_mean=contact_force_mean,
+            joint_effort_l2_peak=joint_effort_l2_peak,
+            joint_effort_l2_mean=joint_effort_l2_mean,
+            joint_load_l2_peak=joint_load_l2_peak,
+            joint_load_l2_mean=joint_load_l2_mean,
+            contact_objects=contact_objects,
+        )

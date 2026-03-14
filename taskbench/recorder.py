@@ -61,9 +61,13 @@ Usage::
 Available robot_fields:
     - ``qpos``         — all joint positions (arm + fingers)
     - ``qvel``         — all joint velocities
+    - ``qf``           — all joint generalized forces / motor effort
+    - ``arm_force_limit`` — commanded arm drive force limit
+    - ``joint_load_l2`` — aggregate norm of incoming joint forces / load proxy
     - ``tcp_pos``      — end-effector position (3,)
     - ``tcp_quat``     — end-effector orientation (4,)
     - ``gripper_qpos`` — finger joint positions (2,)
+    - ``gripper_contact_force`` — estimated peak gripper contact force (N)
 """
 
 import json
@@ -74,15 +78,39 @@ from typing import Any, Dict, List, Optional
 import h5py
 import numpy as np
 
+from taskbench.skills.motion import get_arm_drive_settings, get_gripper_contact_summary
+
 logger = logging.getLogger("taskbench.recorder")
 
-# Each extractor takes (raw_env,) and returns a numpy array
+
+def _extract_gripper_contact_force(raw):
+    """Return the current peak gripper contact force estimate in Newtons."""
+    return float(get_gripper_contact_summary(raw)["peak_force"])
+
+
+def _extract_joint_load_l2(raw):
+    """Return an aggregate internal joint-load proxy for the current step."""
+    incoming = raw.agent.robot.get_link_incoming_joint_forces().cpu().numpy()
+    return float(np.linalg.norm(incoming))
+
+
+def _extract_arm_force_limit(raw):
+    """Return the current commanded arm drive force limit."""
+    settings = get_arm_drive_settings(raw)
+    return 0.0 if settings is None else float(settings["force_limit"])
+
+
+# Each extractor takes (raw_env,) and returns an array-like value.
 _ROBOT_FIELD_EXTRACTORS = {
     "qpos": lambda raw: raw.agent.robot.get_qpos()[0].cpu().numpy(),
     "qvel": lambda raw: raw.agent.robot.get_qvel()[0].cpu().numpy(),
+    "qf": lambda raw: raw.agent.robot.get_qf()[0].cpu().numpy(),
+    "arm_force_limit": _extract_arm_force_limit,
+    "joint_load_l2": _extract_joint_load_l2,
     "tcp_pos": lambda raw: raw.agent.tcp.pose.p[0].cpu().numpy(),
     "tcp_quat": lambda raw: raw.agent.tcp.pose.q[0].cpu().numpy(),
     "gripper_qpos": lambda raw: raw.agent.robot.get_qpos()[0].cpu().numpy()[-2:],
+    "gripper_contact_force": _extract_gripper_contact_force,
 }
 
 

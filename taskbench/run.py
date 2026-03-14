@@ -133,13 +133,7 @@ def run_solver(config, logger: Logger):
     for ep in range(1, target_episodes + 1):
         result = solver.solve(env, seed=config.seed + ep, cfg=config)
 
-        # Let physics settle, then check env success
         raw = env.unwrapped
-        for _ in range(100):
-            env.step(env.action_space.sample() * 0)  # zero action
-            info = raw.evaluate()
-            if info["success"].item():
-                break
         result.success = bool(raw.evaluate()["success"].item())
 
         if recording:

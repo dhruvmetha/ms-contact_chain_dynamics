@@ -59,7 +59,14 @@ Move to a target pose, release the object, wait for it to settle, then retract.
 ### move
 
 ```python
-move_result = ctx.move(target_pose, *, gripper_open=True, monitor_contacts=True)
+move_result = ctx.move(
+    target_pose,
+    *,
+    gripper_open=True,
+    monitor_contacts=True,
+    time_step_scale=1.0,
+    contact_force_threshold=0.01,
+)
 ```
 
 Move the end-effector to a target pose using screw-based motion planning.
@@ -68,24 +75,87 @@ Move the end-effector to a target pose using screw-based motion planning.
 - `target_pose` — target end-effector pose
 - `gripper_open` — gripper state during motion
 - `monitor_contacts` — abort if unexpected contacts occur
+- `time_step_scale` — planner/control waypoint spacing multiplier; values above `1.0` move faster with fewer waypoints
+- `contact_force_threshold` — minimum disallowed contact magnitude treated as a collision
 
-**Returns:** `MoveResult` with `success`, `failure_reason`
+**Returns:** `MoveResult` with `success`, `failure_reason`, plus collision diagnostics (`contact_link`, `contact_entity`, `contact_force`) when the move aborts on contact.
 
 ### push
 
 ```python
-push_result = ctx.push(approach_pose, push_pose, *, clearance_height=0.1, lift_height=0.1)
+push_result = ctx.push(
+    approach_pose,
+    push_pose,
+    staging_pose=None,
+    hover_pose=None,
+    *,
+    clearance_height=0.1,
+    lift_height=0.1,
+    effort_scale=1.0,
+    effort_scale_end=1.0,
+    min_contact_force=0.0,
+    staging_speed_scale=1.0,
+    clearance_speed_scale=1.0,
+    approach_speed_scale=1.0,
+    push_speed_scale=1.0,
+    lift_speed_scale=1.0,
+)
 ```
 
-Approach an object and sweep it to a target position.
+Approach an object and sweep it to a target position with a straight-line Cartesian motion between `approach_pose` and `push_pose`.
 
 **Parameters:**
+- `staging_pose` — optional pre-push pose, useful for vertical pushes that should descend straight down first
+- `hover_pose` — optional pose directly above the approach point for a clean vertical lowering phase
 - `approach_pose` — where to position before pushing
-- `push_pose` — where to push to
+- `push_pose` — where to push to (the sweep target)
 - `clearance_height` — height to lift before approaching
 - `lift_height` — height to lift after pushing
+- `effort_scale` — scale factor on the arm's drive force limit during the push
+- `effort_scale_end` — optional end scale for a linear ramp across the push
+- `min_contact_force` — require at least this peak contact force for success
+- `*_speed_scale` — phase-wise waypoint spacing multipliers; values above `1.0` run faster with fewer waypoints
 
-**Returns:** `PushResult` with `success`, `failure_reason`
+Setting `clearance_height=0` or `lift_height=0` skips that lift phase entirely, which is useful when a solver already stages the tool above the push start pose.
+
+**Returns:** `PushResult` with `success`, `failure_reason`, plus:
+- `push_distance` / `planar_push_distance` — executed start-to-target distance
+- `arm_force_limit_start/end/mean` — commanded arm drive force-limit schedule
+- `contact_force_peak` / `contact_force_mean` — estimated gripper-object contact force from PhysX impulses
+- `joint_load_l2_peak` / `joint_load_l2_mean` — aggregate internal joint-load proxy during the sweep
+- `contact_objects` — object names touched during the push
+
+## Task-Space Push Planning
+
+Pushes are best parameterized in task space, not by robot joint indices. The
+recommended model is:
+
+- contact point in workspace
+- push direction in the plane
+- contact height
+- tool approach axis (`vertical`, `horizontal`, or a custom axis)
+- tool spin/roll around that axis
+
+Use `ctx.plan_linear_push(...)` to build poses from those parameters:
+
+```python
+plan = ctx.plan_linear_push(
+    contact_position=[0.20, -0.03, 0.045],
+    push_angle_deg=35.0,
+    push_distance=0.12,
+    approach_gap=0.05,
+    wrist_orientation="vertical",
+    tool_spin_deg=20.0,
+    hover_height=0.16,
+    staging_height=0.16,
+    staging_backoff=0.04,
+)
+push_result = ctx.push(**plan.as_skill_kwargs())
+```
+
+This keeps the skill general across vertical pushes, horizontal pushes, angled
+pushes, and different tool rolls while leaving IK/planning to choose the
+actual joints.
 
 ## PoseLike
 

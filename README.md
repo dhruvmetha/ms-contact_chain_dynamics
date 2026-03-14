@@ -43,6 +43,18 @@ uv run python -m taskbench.run solver=stack_cubes env.num_cubes=5 run.num_episod
 uv run python -m taskbench.run solver=replay run.solver_kwargs.demo_path=data/success/episode_seed45.hdf5
 ```
 
+### OpenTablePush
+
+Open-faced table push smoke test with a Panda arm and a short row of primitive cylinders. The default solver keeps the wrist vertical over the table, stages above one side of the row, descends, then performs a side-to-side push with a ramped commanded effort schedule. A second config renders a more conventional forward horizontal push. Both write an HDF5 trace to `data/` and save an MP4 to `videos/` when recording is enabled.
+
+```bash
+# Vertical side-push
+uv run python -m taskbench.run solver=open_table_push
+
+# Horizontal forward push
+uv run python -m taskbench.run solver=open_table_push_horizontal
+```
+
 ## Usage
 
 All commands use `uv run` — no manual venv activation needed.
@@ -53,6 +65,12 @@ uv run python -m taskbench.run
 
 # Collect 10 demos with the stack_cubes solver
 uv run python -m taskbench.run solver=stack_cubes run.num_episodes=10
+
+# Record a single open-table push offline (MP4 + HDF5)
+uv run python -m taskbench.run solver=open_table_push
+
+# Record a single horizontal push offline (MP4 + HDF5)
+uv run python -m taskbench.run solver=open_table_push_horizontal
 
 # Replay a recorded demo
 uv run python -m taskbench.run solver=replay run.solver_kwargs.demo_path=data/success/episode_seed45.hdf5
@@ -121,7 +139,15 @@ class MyStackerSolver(BaseSolver):
         return SolverResult(success=bool(info["success"].item()))
 ```
 
-Available skills on `ctx`: `pick(obj_name)`, `place(target_pose)`, `push(approach, push_pose)`, `move(target_pose)`.
+Available skills on `ctx`: `pick(obj_name)`, `place(target_pose)`, `push(approach_pose, push_pose)`, `move(target_pose)`, `plan_linear_push(...)`.
+
+The push primitive uses a straight-line Cartesian sweep between the start and target poses. It now also supports a linearly ramped push-effort schedule by scaling the arm drive force limit during the sweep. Recorded demos can store `robot/arm_force_limit`, `robot/gripper_contact_force`, `robot/joint_load_l2`, and `robot/qf` alongside the trajectory.
+
+For general push setup, prefer task-space parameters over robot joints. Use
+`ctx.plan_linear_push(...)` to describe the contact point, push heading,
+distance, contact height, tool orientation (`vertical` / `horizontal` or a
+custom axis via the lower-level helper), and tool roll. The motion planner
+then maps that pose sequence into joints.
 
 ### 2. Hydra config
 
@@ -153,7 +179,7 @@ You don't have to go through `python -m taskbench.run`. The components are impor
 
 | Component | Import | Purpose |
 |-----------|--------|---------|
-| `SkillContext` | `from taskbench.skills.context import SkillContext` | Main interface — `pick()`, `place()`, `push()`, `move()` |
+| `SkillContext` | `from taskbench.skills.context import SkillContext` | Main interface — `pick()`, `place()`, `push()`, `move()`, `plan_linear_push()` |
 | `make_single_env` | `from taskbench.envs.factory import make_single_env` | Create a single env for motion planning |
 | `StateRecorder` | `from taskbench.recorder import StateRecorder` | Record trajectories + skill programs to HDF5 |
 | `RobotConfig` | `from taskbench.skills.robot_config import get_robot_config` | Robot-specific constants |
