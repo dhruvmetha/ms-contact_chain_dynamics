@@ -1,0 +1,320 @@
+"""Dense open-table bottle clutter for random scene generation."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import sapien
+import torch
+from transforms3d.euler import euler2quat
+from transforms3d.quaternions import qmult
+
+from mani_skill.utils.registration import register_env
+
+from taskbench.envs.open_table_push import (
+    BOTTLE_UPRIGHT_Q,
+    OpenTablePushEnv,
+    TARGET_COLOR,
+)
+from taskbench.envs.open_table_scene import (
+    COMPACT_OPEN_TABLE_CENTER_XY,
+    COMPACT_OPEN_TABLE_SIZE_XY,
+)
+from taskbench.envs.placement import (
+    PlacementGrid,
+    build_rect_grid,
+    clamp_jitter,
+    jitter_positions,
+    sample_frontier_cells,
+)
+
+BOTTLE_COLOR = [0.20, 0.40, 0.85, 1.0]
+
+
+@register_env("OpenTableBottleClutter-v1", max_episode_steps=1400, asset_download_ids=["ycb"])
+class OpenTableBottleClutterEnv(OpenTablePushEnv):
+    """Open table with many bottles placed from a fast clutter sampler.
+
+    The env keeps the bottle physics from ``OpenTablePushEnv`` but switches
+    placement from a short deterministic row to a full-table lattice. A
+    lightweight frontier sampler chooses occupied lattice cells so some scenes
+    are clustered and others are more diffuse without relying on expensive
+    rejection sampling.
+    """
+
+    # Mirrored from ManiSkill's TableSceneBuilder collision box after the
+    # builder rotates the table by +90 degrees about Z.
+    OPEN_TABLE_CENTER_XY = COMPACT_OPEN_TABLE_CENTER_XY.copy()
+    OPEN_TABLE_HALF_EXTENTS_XY = 0.5 * COMPACT_OPEN_TABLE_SIZE_XY[[1, 0]]
+
+    def __init__(
+        self,
+        *args,
+        num_bottles: int = 15,
+        use_full_table_workspace: bool = True,
+        workspace_center_x: float | None = None,
+        workspace_center_y: float | None = None,
+        workspace_half_extent_x: float | None = None,
+        workspace_half_extent_y: float | None = None,
+        edge_margin: float = 0.04,
+        placement_spacing: float = 0.063,
+        placement_clearance: float = 0.001,
+        placement_jitter: float = 0.001,
+        bottle_scale: float = 1.45,
+        layout_mode: str = "auto",
+        dense_layout_prob: float = 0.40,
+        mixed_layout_prob: float = 0.40,
+        num_launch_corridors: int = 0,
+        random_yaw: bool = True,
+        movement_success_threshold: float = 0.02,
+        **kwargs,
+    ):
+        self.bottle_scale = float(bottle_scale)
+        if self.bottle_scale <= 0:
+            raise ValueError("bottle_scale must be positive")
+
+        kwargs.setdefault("bottle_body_radius", 0.020 * self.bottle_scale)
+        kwargs.setdefault("bottle_body_half_length", 0.050 * self.bottle_scale)
+        kwargs.setdefault("bottle_neck_radius", 0.009 * self.bottle_scale)
+        kwargs.setdefault("bottle_neck_half_length", 0.016 * self.bottle_scale)
+        kwargs.setdefault("bottle_neck_offset", 0.046 * self.bottle_scale)
+        kwargs.setdefault("bottle_ballast_radius", 0.018 * self.bottle_scale)
+        kwargs.setdefault("bottle_ballast_half_length", 0.010 * self.bottle_scale)
+        kwargs.setdefault("bottle_ballast_offset", 0.032 * self.bottle_scale)
+        kwargs.setdefault("object_kind", "bottle")
+        kwargs.setdefault("num_cylinders", num_bottles)
+        kwargs.setdefault("push_axis", "x")
+        kwargs.setdefault("push_angle_deg", 0.0)
+        kwargs.setdefault("wrist_orientation", "vertical")
+        kwargs.setdefault("use_staging", False)
+
+        self.num_bottles = int(num_bottles)
+        self.use_full_table_workspace = bool(use_full_table_workspace)
+        self.workspace_center_x = (
+            None if workspace_center_x is None else float(workspace_center_x)
+        )
+        self.workspace_center_y = (
+            None if workspace_center_y is None else float(workspace_center_y)
+        )
+        self.workspace_half_extent_x = (
+            None if workspace_half_extent_x is None else float(workspace_half_extent_x)
+        )
+        self.workspace_half_extent_y = (
+            None if workspace_half_extent_y is None else float(workspace_half_extent_y)
+        )
+        self.edge_margin = float(edge_margin)
+        self.placement_spacing = float(placement_spacing)
+        self.placement_clearance = float(placement_clearance)
+        self.requested_placement_jitter = float(placement_jitter)
+        self.layout_mode = str(layout_mode)
+        self.dense_layout_prob = float(dense_layout_prob)
+        self.mixed_layout_prob = float(mixed_layout_prob)
+        self.num_launch_corridors = int(num_launch_corridors)
+        self.random_yaw = bool(random_yaw)
+        self.movement_success_threshold = float(movement_success_threshold)
+
+        bottle_radius = float(kwargs.get("bottle_body_radius", 0.020))
+        self.min_center_distance = 2.0 * bottle_radius + self.placement_clearance
+        if self.placement_spacing < self.min_center_distance:
+            raise ValueError(
+                "placement_spacing must be at least 2 * bottle_body_radius + "
+                f"placement_clearance ({self.min_center_distance:.4f})"
+            )
+
+        self._workspace_lo_xy = np.zeros((2,), dtype=np.float32)
+        self._workspace_hi_xy = np.zeros((2,), dtype=np.float32)
+        self._placement_lo_xy = np.zeros((2,), dtype=np.float32)
+        self._placement_hi_xy = np.zeros((2,), dtype=np.float32)
+        self._placement_grid: PlacementGrid | None = None
+        self._grid_centers_xy = np.empty((0, 2), dtype=np.float32)
+        self.placement_jitter = 0.0
+
+        super().__init__(*args, **kwargs)
+        self.initial_positions_xy = np.zeros((self.num_bottles, 2), dtype=np.float32)
+        self.launch_corridors: list[dict[str, object]] = []
+        self.scene_layout: dict[str, object] = {}
+
+    def _workspace_bounds_from_config(self) -> tuple[np.ndarray, np.ndarray]:
+        if self.use_full_table_workspace:
+            center_xy = self.OPEN_TABLE_CENTER_XY
+            half_extents_xy = self.OPEN_TABLE_HALF_EXTENTS_XY
+        else:
+            if None in (
+                self.workspace_center_x,
+                self.workspace_center_y,
+                self.workspace_half_extent_x,
+                self.workspace_half_extent_y,
+            ):
+                raise ValueError(
+                    "workspace_center_* and workspace_half_extent_* must all be set "
+                    "when use_full_table_workspace is false"
+                )
+            center_xy = np.array(
+                [self.workspace_center_x, self.workspace_center_y], dtype=np.float32
+            )
+            half_extents_xy = np.array(
+                [self.workspace_half_extent_x, self.workspace_half_extent_y],
+                dtype=np.float32,
+            )
+        lo_xy = center_xy - half_extents_xy
+        hi_xy = center_xy + half_extents_xy
+        return lo_xy.astype(np.float32), hi_xy.astype(np.float32)
+
+    def _configure_placement_workspace(self) -> None:
+        self._workspace_lo_xy, self._workspace_hi_xy = (
+            self._workspace_bounds_from_config()
+        )
+        footprint_margin = self.edge_margin + self._get_visual_footprint_radius()
+        self._placement_lo_xy = self._workspace_lo_xy + footprint_margin
+        self._placement_hi_xy = self._workspace_hi_xy - footprint_margin
+        if np.any(self._placement_hi_xy < self._placement_lo_xy):
+            raise ValueError("edge_margin leaves no usable tabletop area")
+
+        self._placement_grid = build_rect_grid(
+            self._placement_lo_xy, self._placement_hi_xy, self.placement_spacing
+        )
+        self.placement_jitter = clamp_jitter(
+            self.requested_placement_jitter,
+            grid_spacing=self._placement_grid.spacing,
+            min_center_distance=self.min_center_distance,
+        )
+        self._grid_centers_xy = self._placement_grid.centers_xy.copy()
+        if len(self._grid_centers_xy) < self.num_bottles:
+            raise ValueError(
+                f"Workspace only supports {len(self._grid_centers_xy)} bottles at "
+                f"spacing {self.placement_spacing:.3f}, but num_bottles={self.num_bottles}"
+            )
+
+    def _load_scene(self, options: dict):
+        super()._load_scene(options)
+        self._configure_placement_workspace()
+
+    def _build_bottle(self, idx: int):
+        color = TARGET_COLOR if idx == self.target_idx else BOTTLE_COLOR
+        return self._build_bottle_actor(idx, color)
+
+    def get_objects(self) -> dict[str, object]:
+        return {obj.name: obj for obj in self.cylinders}
+
+    def get_workspace_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._workspace_lo_xy.copy(), self._workspace_hi_xy.copy()
+
+    def get_grid_centers(self) -> np.ndarray:
+        return self._grid_centers_xy.copy()
+
+    def get_launch_corridors(self) -> list[dict[str, object]]:
+        return []
+
+    def get_scene_layout(self) -> dict[str, object]:
+        layout = dict(self.scene_layout)
+        if "occupied_indices" in layout:
+            layout["occupied_indices"] = np.asarray(
+                layout["occupied_indices"], dtype=np.int32
+            ).copy()
+        if "seed_indices" in layout:
+            layout["seed_indices"] = np.asarray(
+                layout["seed_indices"], dtype=np.int32
+            ).copy()
+        if "positions_xy" in layout:
+            layout["positions_xy"] = np.asarray(
+                layout["positions_xy"], dtype=np.float32
+            ).copy()
+        return layout
+
+    def is_inside_workspace(self, xy, margin: float = 0.0) -> bool:
+        xy = np.asarray(xy, dtype=np.float32).reshape(-1)[:2]
+        margin = float(margin)
+        return bool(
+            np.all(xy >= self._workspace_lo_xy + margin)
+            and np.all(xy <= self._workspace_hi_xy - margin)
+        )
+
+    def get_bottle_positions_xy(self) -> tuple[list[str], np.ndarray]:
+        names = [obj.name for obj in self.cylinders]
+        positions = np.stack(
+            [
+                obj.pose.p[0, :2].detach().cpu().numpy().astype(np.float32)
+                for obj in self.cylinders
+            ],
+            axis=0,
+        )
+        return names, positions
+
+    def _sample_bottle_quaternion(self) -> np.ndarray:
+        if not self.random_yaw:
+            return np.asarray(BOTTLE_UPRIGHT_Q, dtype=np.float32)
+        yaw = float(self.np_random.uniform(-np.pi, np.pi))
+        yaw_q = euler2quat(0.0, 0.0, yaw)
+        return np.asarray(qmult(yaw_q, BOTTLE_UPRIGHT_Q), dtype=np.float32)
+
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        if self._placement_grid is None:
+            raise RuntimeError("Placement grid is not configured")
+
+        with torch.device(self.device):
+            self.table_scene.initialize(env_idx)
+            z = self.bottle_body_half_length
+            self.launch_corridors = []
+
+            occupied_indices, layout_meta = sample_frontier_cells(
+                self.np_random,
+                self._placement_grid,
+                num_cells=self.num_bottles,
+                mode=self.layout_mode,
+                dense_layout_prob=self.dense_layout_prob,
+                mixed_layout_prob=self.mixed_layout_prob,
+            )
+            self.np_random.shuffle(occupied_indices)
+            centers_xy = self._placement_grid.centers_xy[occupied_indices]
+            positions_xy = jitter_positions(
+                self.np_random,
+                centers_xy,
+                max_jitter=self.placement_jitter,
+                lo_xy=self._placement_lo_xy,
+                hi_xy=self._placement_hi_xy,
+            )
+
+            for idx, xy in enumerate(positions_xy):
+                q = self._sample_bottle_quaternion()
+                self.cylinders[idx].set_pose(sapien.Pose([xy[0], xy[1], z], q))
+
+            _, self.initial_positions_xy = self.get_bottle_positions_xy()
+            self.scene_layout = {
+                **layout_meta,
+                "occupied_indices": occupied_indices.astype(np.int32),
+                "positions_xy": positions_xy.astype(np.float32),
+            }
+
+    def evaluate(self):
+        _, current_xy = self.get_bottle_positions_xy()
+        deltas = current_xy - self.initial_positions_xy
+        displacement = np.linalg.norm(deltas, axis=1)
+        max_displacement = float(displacement.max()) if len(displacement) else 0.0
+        moved_bottles = int(
+            np.count_nonzero(displacement > self.movement_success_threshold)
+        )
+        success = max_displacement > self.movement_success_threshold
+        return {
+            "success": torch.tensor([success], device=self.device, dtype=torch.bool),
+            "max_displacement": torch.tensor(
+                [max_displacement], device=self.device, dtype=torch.float32
+            ),
+            "moved_bottles": torch.tensor(
+                [moved_bottles], device=self.device, dtype=torch.int32
+            ),
+        }
+
+    def _get_obs_extra(self, info: dict):
+        obs = dict(tcp_pose=self.agent.tcp.pose.raw_pose)
+        for obj in self.cylinders:
+            obs[f"{obj.name}_pose"] = obj.pose.raw_pose
+        return obs
+
+    def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
+        return torch.zeros(self.num_envs, device=self.device)
+
+    def compute_normalized_dense_reward(
+        self, obs: Any, action: torch.Tensor, info: dict
+    ):
+        return torch.zeros(self.num_envs, device=self.device)
