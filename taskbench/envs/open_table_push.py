@@ -13,8 +13,6 @@ import numpy as np
 import sapien
 import sapien.render
 import torch
-from transforms3d.quaternions import qinverse
-
 from mani_skill import ASSET_DIR
 from mani_skill.agents.robots import Panda
 from mani_skill.sensors.camera import CameraConfig
@@ -22,13 +20,18 @@ from mani_skill.utils import sapien_utils
 from mani_skill.utils.io_utils import load_json
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs.types import SceneConfig, SimConfig
+from transforms3d.quaternions import qinverse
 
 from taskbench.envs.base import TaskEnv
-from taskbench.envs.open_table_scene import (
-    COMPACT_OPEN_TABLE_CENTER_XY,
-    CompactOpenTableSceneBuilder,
-)
-from taskbench.skills.motion import make_linear_push_plan, tcp_height_for_table_clearance
+from taskbench.envs.open_table_defaults import (
+    BOTTLE_BALLAST_HALF_LENGTH_BASE, BOTTLE_BALLAST_OFFSET_BASE,
+    BOTTLE_BALLAST_RADIUS_BASE, BOTTLE_BODY_HALF_LENGTH_BASE,
+    BOTTLE_BODY_RADIUS_BASE, BOTTLE_NECK_HALF_LENGTH_BASE,
+    BOTTLE_NECK_OFFSET_BASE, BOTTLE_NECK_RADIUS_BASE, BOTTLE_VISUAL_STYLE)
+from taskbench.envs.open_table_scene import (COMPACT_OPEN_TABLE_CENTER_XY,
+                                             CompactOpenTableSceneBuilder)
+from taskbench.skills.motion import (make_linear_push_plan,
+                                     tcp_height_for_table_clearance)
 
 TARGET_COLOR = [0.90, 0.15, 0.15, 1.0]
 OBSTACLE_COLOR = [0.20, 0.40, 0.85, 1.0]
@@ -62,17 +65,17 @@ class OpenTablePushEnv(TaskEnv):
         object_density: float = 1800.0,
         cylinder_radius: float = 0.018,
         cylinder_half_length: float = 0.045,
-        bottle_body_radius: float = 0.020,
-        bottle_body_half_length: float = 0.050,
-        bottle_neck_radius: float = 0.009,
-        bottle_neck_half_length: float = 0.016,
-        bottle_neck_offset: float = 0.046,
+        bottle_body_radius: float = BOTTLE_BODY_RADIUS_BASE,
+        bottle_body_half_length: float = BOTTLE_BODY_HALF_LENGTH_BASE,
+        bottle_neck_radius: float = BOTTLE_NECK_RADIUS_BASE,
+        bottle_neck_half_length: float = BOTTLE_NECK_HALF_LENGTH_BASE,
+        bottle_neck_offset: float = BOTTLE_NECK_OFFSET_BASE,
         bottle_neck_density_scale: float = 0.5,
-        bottle_ballast_radius: float = 0.018,
-        bottle_ballast_half_length: float = 0.010,
-        bottle_ballast_offset: float = 0.032,
+        bottle_ballast_radius: float = BOTTLE_BALLAST_RADIUS_BASE,
+        bottle_ballast_half_length: float = BOTTLE_BALLAST_HALF_LENGTH_BASE,
+        bottle_ballast_offset: float = BOTTLE_BALLAST_OFFSET_BASE,
         bottle_ballast_density_scale: float = 4.0,
-        bottle_visual_style: str = "ycb_mustard",
+        bottle_visual_style: str = BOTTLE_VISUAL_STYLE,
         ycb_bottle_model_id: str = YCB_MUSTARD_BOTTLE_ID,
         push_axis: str = "y",
         push_angle_deg: float | None = None,
@@ -104,7 +107,9 @@ class OpenTablePushEnv(TaskEnv):
         **kwargs,
     ):
         if push_axis not in {"x", "y"}:
-            raise ValueError(f"Unsupported push_axis={push_axis!r}; expected 'x' or 'y'")
+            raise ValueError(
+                f"Unsupported push_axis={push_axis!r}; expected 'x' or 'y'"
+            )
         if object_kind not in {"cylinder", "bottle"}:
             raise ValueError(
                 f"Unsupported object_kind={object_kind!r}; expected 'cylinder' or 'bottle'"
@@ -147,7 +152,9 @@ class OpenTablePushEnv(TaskEnv):
         self.push_angle_deg = float(push_angle_deg)
         self.wrist_orientation = wrist_orientation
         self.tool_spin_deg = float(tool_spin_deg)
-        if any(v is not None for v in (approach_axis_x, approach_axis_y, approach_axis_z)):
+        if any(
+            v is not None for v in (approach_axis_x, approach_axis_y, approach_axis_z)
+        ):
             if None in (approach_axis_x, approach_axis_y, approach_axis_z):
                 raise ValueError(
                     "approach_axis_x, approach_axis_y, and approach_axis_z must all be set together"
@@ -365,7 +372,9 @@ class OpenTablePushEnv(TaskEnv):
             raise ValueError(f"Invalid YCB bottle metadata for {model_id!r}")
         return float(self.bottle_body_radius / half_extent_xy)
 
-    def _get_ycb_bottle_visual_pose(self, model_id: str, *, scale: float) -> sapien.Pose:
+    def _get_ycb_bottle_visual_pose(
+        self, model_id: str, *, scale: float
+    ) -> sapien.Pose:
         meta = _load_ycb_metadata(model_id)
         bbox = meta["bbox"]
         bottom_z = float(bbox["min"][2]) * scale
@@ -404,13 +413,21 @@ class OpenTablePushEnv(TaskEnv):
             else:
                 z = self.cylinder_half_length
             for i, obj in enumerate(self.cylinders):
-                xy = self.row_origin_xy + self.push_direction_xy * (i * self.row_spacing)
+                xy = self.row_origin_xy + self.push_direction_xy * (
+                    i * self.row_spacing
+                )
                 upright_q = (
-                    BOTTLE_UPRIGHT_Q if self.object_kind == "bottle" else CYLINDER_UPRIGHT_Q
+                    BOTTLE_UPRIGHT_Q
+                    if self.object_kind == "bottle"
+                    else CYLINDER_UPRIGHT_Q
                 )
                 obj.set_pose(sapien.Pose([xy[0], xy[1], z], upright_q))
             self.initial_target_xy = (
-                self.target_object.pose.p[0, :2].detach().cpu().numpy().astype(np.float32)
+                self.target_object.pose.p[0, :2]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
             )
 
     def get_push_plan(self):
@@ -419,15 +436,18 @@ class OpenTablePushEnv(TaskEnv):
         With ``use_staging=True`` the solver should stage at ``staging_pose``
         first, descend to ``approach_pose``, then sweep to ``push_pose``.
         """
-        z = tcp_height_for_table_clearance(
-            self.agent,
-            self.push_direction_xy,
-            wrist_orientation=self.wrist_orientation,
-            tool_spin_deg=self.tool_spin_deg,
-            approach_axis=self.approach_axis,
-            table_z=0.0,
-            table_clearance=self.table_clearance,
-        ) + self.push_height_offset
+        z = (
+            tcp_height_for_table_clearance(
+                self.agent,
+                self.push_direction_xy,
+                wrist_orientation=self.wrist_orientation,
+                tool_spin_deg=self.tool_spin_deg,
+                approach_axis=self.approach_axis,
+                table_z=0.0,
+                table_clearance=self.table_clearance,
+            )
+            + self.push_height_offset
+        )
         push_distance = (self.num_cylinders - 1) * self.row_spacing + self.end_margin
         contact_position = np.array(
             [self.row_origin_xy[0], self.row_origin_xy[1], z], dtype=np.float32
@@ -458,7 +478,9 @@ class OpenTablePushEnv(TaskEnv):
         return plan["approach_pose"], plan["push_pose"]
 
     def evaluate(self):
-        target_xy = self.target_object.pose.p[0, :2].detach().cpu().numpy().astype(np.float32)
+        target_xy = (
+            self.target_object.pose.p[0, :2].detach().cpu().numpy().astype(np.float32)
+        )
         delta_xy = target_xy - self.initial_target_xy
         target_displacement = float(np.dot(delta_xy, self.push_direction_xy))
         success = target_displacement > self.success_displacement

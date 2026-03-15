@@ -7,32 +7,31 @@ from typing import Any
 import numpy as np
 import sapien
 import torch
+from mani_skill.utils.registration import register_env
 from transforms3d.euler import euler2quat
 from transforms3d.quaternions import qmult
 
-from mani_skill.utils.registration import register_env
-
-from taskbench.envs.open_table_push import (
-    BOTTLE_UPRIGHT_Q,
-    OpenTablePushEnv,
-    TARGET_COLOR,
-)
-from taskbench.envs.open_table_scene import (
-    COMPACT_OPEN_TABLE_CENTER_XY,
-    COMPACT_OPEN_TABLE_SIZE_XY,
-)
-from taskbench.envs.placement import (
-    PlacementGrid,
-    build_rect_grid,
-    clamp_jitter,
-    jitter_positions,
-    sample_frontier_cells,
-)
+from taskbench.envs.open_table_defaults import (
+    BOTTLE_BALLAST_HALF_LENGTH_BASE, BOTTLE_BALLAST_OFFSET_BASE,
+    BOTTLE_BALLAST_RADIUS_BASE, BOTTLE_BODY_HALF_LENGTH_BASE,
+    BOTTLE_BODY_RADIUS_BASE, BOTTLE_NECK_HALF_LENGTH_BASE,
+    BOTTLE_NECK_OFFSET_BASE, BOTTLE_NECK_RADIUS_BASE, BOTTLE_SCALE,
+    DENSE_LAYOUT_PROB, EDGE_MARGIN, MIXED_LAYOUT_PROB, PANDA_TABLE_DEFAULTS,
+    PLACEMENT_CLEARANCE, PLACEMENT_JITTER, PLACEMENT_SPACING)
+from taskbench.envs.open_table_push import (BOTTLE_UPRIGHT_Q, TARGET_COLOR,
+                                            OpenTablePushEnv)
+from taskbench.envs.open_table_scene import (COMPACT_OPEN_TABLE_CENTER_XY,
+                                             COMPACT_OPEN_TABLE_SIZE_XY)
+from taskbench.envs.placement import (PlacementGrid, build_rect_grid,
+                                      clamp_jitter, jitter_positions,
+                                      sample_frontier_cells)
 
 BOTTLE_COLOR = [0.20, 0.40, 0.85, 1.0]
 
 
-@register_env("OpenTableBottleClutter-v1", max_episode_steps=1400, asset_download_ids=["ycb"])
+@register_env(
+    "OpenTableBottleClutter-v1", max_episode_steps=1400, asset_download_ids=["ycb"]
+)
 class OpenTableBottleClutterEnv(OpenTablePushEnv):
     """Open table with many bottles placed from a fast clutter sampler.
 
@@ -57,14 +56,14 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
         workspace_center_y: float | None = None,
         workspace_half_extent_x: float | None = None,
         workspace_half_extent_y: float | None = None,
-        edge_margin: float = 0.04,
-        placement_spacing: float = 0.063,
-        placement_clearance: float = 0.001,
-        placement_jitter: float = 0.001,
-        bottle_scale: float = 1.45,
+        edge_margin: float = EDGE_MARGIN,
+        placement_spacing: float = PLACEMENT_SPACING,
+        placement_clearance: float = PLACEMENT_CLEARANCE,
+        placement_jitter: float = PLACEMENT_JITTER,
+        bottle_scale: float = BOTTLE_SCALE,
         layout_mode: str = "auto",
-        dense_layout_prob: float = 0.40,
-        mixed_layout_prob: float = 0.40,
+        dense_layout_prob: float = DENSE_LAYOUT_PROB,
+        mixed_layout_prob: float = MIXED_LAYOUT_PROB,
         num_launch_corridors: int = 0,
         random_yaw: bool = True,
         movement_success_threshold: float = 0.02,
@@ -74,14 +73,31 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
         if self.bottle_scale <= 0:
             raise ValueError("bottle_scale must be positive")
 
-        kwargs.setdefault("bottle_body_radius", 0.020 * self.bottle_scale)
-        kwargs.setdefault("bottle_body_half_length", 0.050 * self.bottle_scale)
-        kwargs.setdefault("bottle_neck_radius", 0.009 * self.bottle_scale)
-        kwargs.setdefault("bottle_neck_half_length", 0.016 * self.bottle_scale)
-        kwargs.setdefault("bottle_neck_offset", 0.046 * self.bottle_scale)
-        kwargs.setdefault("bottle_ballast_radius", 0.018 * self.bottle_scale)
-        kwargs.setdefault("bottle_ballast_half_length", 0.010 * self.bottle_scale)
-        kwargs.setdefault("bottle_ballast_offset", 0.032 * self.bottle_scale)
+        kwargs.setdefault(
+            "bottle_body_radius", BOTTLE_BODY_RADIUS_BASE * self.bottle_scale
+        )
+        kwargs.setdefault(
+            "bottle_body_half_length", BOTTLE_BODY_HALF_LENGTH_BASE * self.bottle_scale
+        )
+        kwargs.setdefault(
+            "bottle_neck_radius", BOTTLE_NECK_RADIUS_BASE * self.bottle_scale
+        )
+        kwargs.setdefault(
+            "bottle_neck_half_length", BOTTLE_NECK_HALF_LENGTH_BASE * self.bottle_scale
+        )
+        kwargs.setdefault(
+            "bottle_neck_offset", BOTTLE_NECK_OFFSET_BASE * self.bottle_scale
+        )
+        kwargs.setdefault(
+            "bottle_ballast_radius", BOTTLE_BALLAST_RADIUS_BASE * self.bottle_scale
+        )
+        kwargs.setdefault(
+            "bottle_ballast_half_length",
+            BOTTLE_BALLAST_HALF_LENGTH_BASE * self.bottle_scale,
+        )
+        kwargs.setdefault(
+            "bottle_ballast_offset", BOTTLE_BALLAST_OFFSET_BASE * self.bottle_scale
+        )
         kwargs.setdefault("object_kind", "bottle")
         kwargs.setdefault("num_cylinders", num_bottles)
         kwargs.setdefault("push_axis", "x")
@@ -162,9 +178,10 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
         return lo_xy.astype(np.float32), hi_xy.astype(np.float32)
 
     def _configure_placement_workspace(self) -> None:
-        self._workspace_lo_xy, self._workspace_hi_xy = (
-            self._workspace_bounds_from_config()
-        )
+        (
+            self._workspace_lo_xy,
+            self._workspace_hi_xy,
+        ) = self._workspace_bounds_from_config()
         footprint_margin = self.edge_margin + self._get_visual_footprint_radius()
         self._placement_lo_xy = self._workspace_lo_xy + footprint_margin
         self._placement_hi_xy = self._workspace_hi_xy - footprint_margin
@@ -342,6 +359,23 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
 
         with torch.device(self.device):
             self.table_scene.initialize(env_idx)
+
+            # Validate that ManiSkill's scene builder still places the robot
+            # where we expect.  The algorithmic scene sampler in
+            # generate_clutter_scene_library.py bakes these values into HDF5
+            # files, so a silent upstream change would corrupt generated data.
+            _actual_pos = self.agent.robot.pose.p[0].detach().cpu().numpy()
+            _actual_qpos = self.agent.robot.get_qpos()[0].detach().cpu().numpy()
+            assert np.allclose(
+                _actual_pos, PANDA_TABLE_DEFAULTS.root_position, atol=1e-3
+            ), (
+                f"Robot root pose drifted from expected {PANDA_TABLE_DEFAULTS.root_position}: "
+                f"got {_actual_pos.tolist()}"
+            )
+            assert np.allclose(
+                _actual_qpos, PANDA_TABLE_DEFAULTS.home_qpos, atol=1e-3
+            ), f"Robot home qpos drifted from expected: got {_actual_qpos.tolist()}"
+
             z = self.bottle_body_half_length
             self.launch_corridors = []
 

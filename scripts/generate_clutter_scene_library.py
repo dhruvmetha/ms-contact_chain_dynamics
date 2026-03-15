@@ -18,57 +18,27 @@ import imageio.v3 as iio
 import mani_skill.envs  # noqa: F401 - registers ManiSkill envs
 import numpy as np
 import sapien
-import taskbench.envs  # noqa: F401 - registers taskbench envs
 from PIL import Image
 from transforms3d.euler import euler2quat
 from transforms3d.quaternions import qmult
 
-from taskbench.envs.open_table_push import (
-    BOTTLE_UPRIGHT_Q,
-    YCB_MUSTARD_BOTTLE_ID,
-    _load_ycb_metadata,
-)
-from taskbench.envs.open_table_scene import (
-    COMPACT_OPEN_TABLE_CENTER_XY,
-    COMPACT_OPEN_TABLE_SIZE_XY,
-)
-from taskbench.envs.placement import (
-    build_rect_grid,
-    clamp_jitter,
-    jitter_positions,
-    sample_frontier_cells,
-)
-
-
-_DEFAULT_BOTTLE_SCALE = 1.45
-_DEFAULT_EDGE_MARGIN = 0.04
-_DEFAULT_PLACEMENT_SPACING = 0.063
-_DEFAULT_PLACEMENT_CLEARANCE = 0.001
-_DEFAULT_PLACEMENT_JITTER = 0.001
-_DEFAULT_DENSE_LAYOUT_PROB = 0.40
-_DEFAULT_MIXED_LAYOUT_PROB = 0.40
-_DEFAULT_BOTTLE_VISUAL_STYLE = "ycb_mustard"
-_DEFAULT_USE_RANDOM_YAW = True
-_DEFAULT_BOTTLE_BODY_RADIUS = 0.020 * _DEFAULT_BOTTLE_SCALE
-_DEFAULT_BOTTLE_BODY_HALF_LENGTH = 0.050 * _DEFAULT_BOTTLE_SCALE
-_DEFAULT_ROBOT_ROOT_POSITION = np.array(
-    [-0.6150000095367432, 0.0, 0.0], dtype=np.float32
-)
-_DEFAULT_ROBOT_ROOT_QUAT = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-_DEFAULT_ROBOT_QPOS = np.array(
-    [
-        0.0,
-        0.39269909262657166,
-        0.0,
-        -1.9634953737258911,
-        0.0,
-        2.356194496154785,
-        0.7853981852531433,
-        0.03999999910593033,
-        0.03999999910593033,
-    ],
-    dtype=np.float32,
-)
+import taskbench.envs  # noqa: F401 - registers taskbench envs
+from taskbench.envs.open_table_defaults import (BOTTLE_BODY_HALF_LENGTH,
+                                                BOTTLE_BODY_RADIUS,
+                                                BOTTLE_VISUAL_STYLE,
+                                                DENSE_LAYOUT_PROB, EDGE_MARGIN,
+                                                MIXED_LAYOUT_PROB,
+                                                PANDA_TABLE_DEFAULTS,
+                                                PLACEMENT_CLEARANCE,
+                                                PLACEMENT_JITTER,
+                                                PLACEMENT_SPACING, RANDOM_YAW)
+from taskbench.envs.open_table_push import (BOTTLE_UPRIGHT_Q,
+                                            YCB_MUSTARD_BOTTLE_ID,
+                                            _load_ycb_metadata)
+from taskbench.envs.open_table_scene import (COMPACT_OPEN_TABLE_CENTER_XY,
+                                             COMPACT_OPEN_TABLE_SIZE_XY)
+from taskbench.envs.placement import (build_rect_grid, clamp_jitter,
+                                      jitter_positions, sample_frontier_cells)
 
 
 def parse_args() -> argparse.Namespace:
@@ -237,14 +207,16 @@ def _use_algorithmic_scene_sampler(args: argparse.Namespace) -> bool:
 
 def _algorithmic_workspace_bounds() -> tuple[np.ndarray, np.ndarray]:
     center_xy = np.asarray(COMPACT_OPEN_TABLE_CENTER_XY, dtype=np.float32)
-    half_extents_xy = 0.5 * np.asarray(COMPACT_OPEN_TABLE_SIZE_XY[[1, 0]], dtype=np.float32)
+    half_extents_xy = 0.5 * np.asarray(
+        COMPACT_OPEN_TABLE_SIZE_XY[[1, 0]], dtype=np.float32
+    )
     lo_xy = center_xy - half_extents_xy
     hi_xy = center_xy + half_extents_xy
     return lo_xy.astype(np.float32), hi_xy.astype(np.float32)
 
 
 def _algorithmic_visual_footprint_radius() -> float:
-    radius = float(_DEFAULT_BOTTLE_BODY_RADIUS)
+    radius = float(BOTTLE_BODY_RADIUS)
     meta = _load_ycb_metadata(YCB_MUSTARD_BOTTLE_ID)
     bbox = meta["bbox"]
     half_extent_x = max(abs(float(bbox["min"][0])), abs(float(bbox["max"][0])))
@@ -258,7 +230,7 @@ def _algorithmic_visual_footprint_radius() -> float:
 
 
 def _sample_algorithmic_bottle_quaternion(rng: np.random.Generator) -> np.ndarray:
-    if not _DEFAULT_USE_RANDOM_YAW:
+    if not RANDOM_YAW:
         return np.asarray(BOTTLE_UPRIGHT_Q, dtype=np.float32)
     yaw = float(rng.uniform(-np.pi, np.pi))
     yaw_q = euler2quat(0.0, 0.0, yaw)
@@ -270,20 +242,18 @@ def _sample_algorithmic_scene_spec(
 ) -> dict[str, object]:
     rng = np.random.default_rng(seed)
     workspace_lo_xy, workspace_hi_xy = _algorithmic_workspace_bounds()
-    footprint_margin = _DEFAULT_EDGE_MARGIN + _algorithmic_visual_footprint_radius()
+    footprint_margin = EDGE_MARGIN + _algorithmic_visual_footprint_radius()
     placement_lo_xy = workspace_lo_xy + footprint_margin
     placement_hi_xy = workspace_hi_xy - footprint_margin
     if np.any(placement_hi_xy < placement_lo_xy):
         raise ValueError("Configured edge margin leaves no usable tabletop area")
 
     placement_grid = build_rect_grid(
-        placement_lo_xy, placement_hi_xy, _DEFAULT_PLACEMENT_SPACING
+        placement_lo_xy, placement_hi_xy, PLACEMENT_SPACING
     )
-    min_center_distance = (
-        2.0 * float(_DEFAULT_BOTTLE_BODY_RADIUS) + _DEFAULT_PLACEMENT_CLEARANCE
-    )
+    min_center_distance = 2.0 * float(BOTTLE_BODY_RADIUS) + PLACEMENT_CLEARANCE
     placement_jitter = clamp_jitter(
-        _DEFAULT_PLACEMENT_JITTER,
+        PLACEMENT_JITTER,
         grid_spacing=placement_grid.spacing,
         min_center_distance=min_center_distance,
     )
@@ -292,8 +262,8 @@ def _sample_algorithmic_scene_spec(
         placement_grid,
         num_cells=args.num_bottles,
         mode=args.layout_mode,
-        dense_layout_prob=_DEFAULT_DENSE_LAYOUT_PROB,
-        mixed_layout_prob=_DEFAULT_MIXED_LAYOUT_PROB,
+        dense_layout_prob=DENSE_LAYOUT_PROB,
+        mixed_layout_prob=MIXED_LAYOUT_PROB,
     )
     rng.shuffle(occupied_indices)
     centers_xy = placement_grid.centers_xy[occupied_indices]
@@ -309,17 +279,14 @@ def _sample_algorithmic_scene_spec(
             positions_xy,
             np.full(
                 (args.num_bottles, 1),
-                _DEFAULT_BOTTLE_BODY_HALF_LENGTH,
+                BOTTLE_BODY_HALF_LENGTH,
                 dtype=np.float32,
             ),
         ],
         axis=1,
     ).astype(np.float32)
     quats_wxyz = np.stack(
-        [
-            _sample_algorithmic_bottle_quaternion(rng)
-            for _ in range(args.num_bottles)
-        ],
+        [_sample_algorithmic_bottle_quaternion(rng) for _ in range(args.num_bottles)],
         axis=0,
     ).astype(np.float32)
     scene_layout = {
@@ -334,9 +301,9 @@ def _sample_algorithmic_scene_spec(
         "object_names": [f"bottle_{i}" for i in range(args.num_bottles)],
         "object_positions_xyz": positions_xyz,
         "object_quats_wxyz": quats_wxyz,
-        "robot_root_position_xyz": _DEFAULT_ROBOT_ROOT_POSITION.copy(),
-        "robot_root_quat_wxyz": _DEFAULT_ROBOT_ROOT_QUAT.copy(),
-        "robot_qpos": _DEFAULT_ROBOT_QPOS.copy(),
+        "robot_root_position_xyz": PANDA_TABLE_DEFAULTS.root_position_array(),
+        "robot_root_quat_wxyz": PANDA_TABLE_DEFAULTS.root_quat_array(),
+        "robot_qpos": PANDA_TABLE_DEFAULTS.home_qpos_array(),
         "workspace_lo_xy": workspace_lo_xy,
         "workspace_hi_xy": workspace_hi_xy,
         "layout": scene_layout,
@@ -535,12 +502,14 @@ def main() -> None:
                     else "env"
                 )
                 meta.attrs["bottle_visual_style"] = (
-                    _DEFAULT_BOTTLE_VISUAL_STYLE
+                    BOTTLE_VISUAL_STYLE
                     if raw is None
                     else getattr(raw, "bottle_visual_style", "")
                 )
                 meta.attrs["target_index"] = int(
-                    args.num_bottles - 1 if raw is None else getattr(raw, "target_idx", -1)
+                    args.num_bottles - 1
+                    if raw is None
+                    else getattr(raw, "target_idx", -1)
                 )
                 if _should_render(args):
                     meta.attrs["image_size"] = int(args.image_size)
@@ -561,7 +530,9 @@ def main() -> None:
                     positions = np.asarray(
                         scene_spec["object_positions_xyz"], dtype=np.float32
                     )
-                    quats = np.asarray(scene_spec["object_quats_wxyz"], dtype=np.float32)
+                    quats = np.asarray(
+                        scene_spec["object_quats_wxyz"], dtype=np.float32
+                    )
                     robot_root_position = np.asarray(
                         scene_spec["robot_root_position_xyz"], dtype=np.float32
                     )
@@ -570,7 +541,9 @@ def main() -> None:
                     )
                     robot_qpos = np.asarray(scene_spec["robot_qpos"], dtype=np.float32)
                     scene_layout = scene_spec["layout"]
-                    scene_layout_json = json.dumps(_jsonify(scene_layout), sort_keys=True)
+                    scene_layout_json = json.dumps(
+                        _jsonify(scene_layout), sort_keys=True
+                    )
                     layout_mode = str(scene_layout.get("layout_mode", args.layout_mode))
                     layout_variant = str(scene_layout.get("layout_variant", ""))
                     rgb = None
@@ -599,7 +572,12 @@ def main() -> None:
                         if args.include_rgb:
                             rgb_ds = f.create_dataset(
                                 "rgb",
-                                shape=(scene_count, rgb.shape[0], rgb.shape[1], rgb.shape[2]),
+                                shape=(
+                                    scene_count,
+                                    rgb.shape[0],
+                                    rgb.shape[1],
+                                    rgb.shape[2],
+                                ),
                                 dtype=np.uint8,
                                 chunks=(1, rgb.shape[0], rgb.shape[1], rgb.shape[2]),
                                 **compression_kwargs,
@@ -668,7 +646,9 @@ def main() -> None:
                         rgb_ds[local_idx] = rgb
 
                     if args.save_preview_pngs and local_idx < args.preview_count:
-                        preview_path = preview_dir / f"{shard_stem}_scene_{local_idx:04d}.png"
+                        preview_path = (
+                            preview_dir / f"{shard_stem}_scene_{local_idx:04d}.png"
+                        )
                         preview_rgb = _render_preview_scene(
                             env,
                             args.image_size,
@@ -708,17 +688,17 @@ def main() -> None:
             "base_seed": int(args.base_seed),
             "seed_start": int(args.base_seed + start_index),
             "seed_end_exclusive": int(args.base_seed + end_index),
-        "num_bottles": int(args.num_bottles),
-        "layout_mode": args.layout_mode,
-        "include_rgb": bool(args.include_rgb),
-        "hide_robot_in_preview": bool(args.hide_robot_in_preview),
-        "generation_backend": (
-            "algorithmic_sampler" if _use_algorithmic_scene_sampler(args) else "env"
-        ),
-        "image_size": int(args.image_size) if _should_render(args) else None,
-        "compression": args.compression,
-        "hdf5_path": str(shard_path),
-    }
+            "num_bottles": int(args.num_bottles),
+            "layout_mode": args.layout_mode,
+            "include_rgb": bool(args.include_rgb),
+            "hide_robot_in_preview": bool(args.hide_robot_in_preview),
+            "generation_backend": (
+                "algorithmic_sampler" if _use_algorithmic_scene_sampler(args) else "env"
+            ),
+            "image_size": int(args.image_size) if _should_render(args) else None,
+            "compression": args.compression,
+            "hdf5_path": str(shard_path),
+        }
         manifest_fd, manifest_name = tempfile.mkstemp(
             prefix=f"{shard_stem}.", suffix=".tmp.json", dir=str(manifest_dir)
         )
