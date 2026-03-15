@@ -799,6 +799,9 @@ def follow_path(env, result, gripper_state, robot_config: RobotConfig,
             )
             return None
     n_step = result["position"].shape[0]
+    if n_step == 0:
+        logger.warning("Planned path has zero waypoints; treating as a no-op")
+        return None, 0.0, False, False, {}
     has_velocity = "velocity" in result
     for i in range(n_step + refine_steps):
         idx = min(i, n_step - 1)

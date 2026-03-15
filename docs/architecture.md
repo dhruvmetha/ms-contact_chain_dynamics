@@ -18,6 +18,7 @@ taskbench/                          # Core framework
     stack_cube_distractor.py        # StackCubeDistractor-v1 (2-cube + distractor)
     shelf_env.py                    # ShelfEnv-v1 (enclosed shelf with cylinders)
     bin_with_objects.py             # BinWithObjects-v1 (bin of primitives + YCB)
+    open_table_bottle_clutter.py    # OpenTableBottleClutter-v1 (dense bottle clutter)
   skills/
     robot_config.py                 # RobotConfig dataclass + registry
     context.py                      # SkillContext — bundles env + planner + skills
@@ -29,6 +30,7 @@ taskbench/                          # Core framework
     replay.py                       # ReplaySolver (@register_solver)
     demo_recorder.py                # DemoRecorderSolver (@register_solver)
     shelf_reachability.py           # ShelfReachabilitySolver (@register_solver)
+    dense_random_push.py            # DenseRandomPushSolver (@register_solver)
 
 configs/
   default.yaml                      # Default Hydra config (YAML-only, no Python dataclasses)
@@ -86,6 +88,7 @@ class TaskEnv(BaseEnv, metaclass=ABCMeta):
 | `StackCubeDistractor-v1` | `StackCubeDistractorEnv` | `{"cube_0": green, "cube_1": red, "cube_2": blue}` | 2-cube stacking + blue distractor |
 | `ShelfEnv-v1` | `ShelfEnv` | `{"cyl_0": ..., "cyl_19": ...}` | Enclosed shelf, 19 blue + 1 red cylinder |
 | `BinWithObjects-v1` | `BinWithObjectsEnv` | `{obj.name: obj, ...}` | Bin with ~30 random primitives + YCB objects |
+| `OpenTableBottleClutter-v1` | `OpenTableBottleClutterEnv` | `{"bottle_0": ..., "bottle_N": ...}` | Open table with dense random bottle placements for push-data collection |
 
 ### Environment Factories
 

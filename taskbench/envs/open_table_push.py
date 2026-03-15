@@ -1,34 +1,50 @@
 """Open-table push environment for quick offline push testing.
 
 An open table sits in front of the Panda arm. A short row of upright
-primitive cylinders is placed on the tabletop and can be pushed along any
-planar heading with either a vertical or horizontal wrist pose.
+objects is placed on the tabletop and can be pushed along any planar
+heading with either a vertical or horizontal wrist pose.
 """
 
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Union
 
 import numpy as np
 import sapien
 import sapien.render
 import torch
+from transforms3d.quaternions import qinverse
 
+from mani_skill import ASSET_DIR
 from mani_skill.agents.robots import Panda
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
+from mani_skill.utils.io_utils import load_json
 from mani_skill.utils.registration import register_env
-from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.types import SceneConfig, SimConfig
 
 from taskbench.envs.base import TaskEnv
+from taskbench.envs.open_table_scene import (
+    COMPACT_OPEN_TABLE_CENTER_XY,
+    CompactOpenTableSceneBuilder,
+)
 from taskbench.skills.motion import make_linear_push_plan, tcp_height_for_table_clearance
 
 TARGET_COLOR = [0.90, 0.15, 0.15, 1.0]
 OBSTACLE_COLOR = [0.20, 0.40, 0.85, 1.0]
 CYLINDER_UPRIGHT_Q = [0.7071068, 0.0, 0.7071068, 0.0]
 BOTTLE_UPRIGHT_Q = [0.7071068, 0.0, -0.7071068, 0.0]
+YCB_MUSTARD_BOTTLE_ID = "006_mustard_bottle"
 
 
-@register_env("OpenTablePush-v1", max_episode_steps=320)
+@lru_cache(maxsize=None)
+def _load_ycb_metadata(model_id: str) -> dict:
+    metadata_path = Path(ASSET_DIR) / "assets" / "mani_skill2_ycb" / "info_pick_v0.json"
+    model_db = load_json(metadata_path)
+    return model_db[model_id]
+
+
+@register_env("OpenTablePush-v1", max_episode_steps=320, asset_download_ids=["ycb"])
 class OpenTablePushEnv(TaskEnv):
     """Open table with a line of cylinders for deterministic push tests."""
 
@@ -56,6 +72,8 @@ class OpenTablePushEnv(TaskEnv):
         bottle_ballast_half_length: float = 0.010,
         bottle_ballast_offset: float = 0.032,
         bottle_ballast_density_scale: float = 4.0,
+        bottle_visual_style: str = "ycb_mustard",
+        ycb_bottle_model_id: str = YCB_MUSTARD_BOTTLE_ID,
         push_axis: str = "y",
         push_angle_deg: float | None = None,
         wrist_orientation: str = "vertical",
@@ -121,6 +139,8 @@ class OpenTablePushEnv(TaskEnv):
         self.bottle_ballast_half_length = float(bottle_ballast_half_length)
         self.bottle_ballast_offset = float(bottle_ballast_offset)
         self.bottle_ballast_density_scale = float(bottle_ballast_density_scale)
+        self.bottle_visual_style = str(bottle_visual_style)
+        self.ycb_bottle_model_id = str(ycb_bottle_model_id)
         self.push_axis = push_axis
         if push_angle_deg is None:
             push_angle_deg = 0.0 if push_axis == "x" else 90.0
@@ -212,13 +232,21 @@ class OpenTablePushEnv(TaskEnv):
 
     @property
     def _default_sensor_configs(self):
-        pose = sapien_utils.look_at(eye=[0.46, -0.40, 0.45], target=[0.20, 0.0, 0.06])
-        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
+        center_x, center_y = COMPACT_OPEN_TABLE_CENTER_XY
+        pose = sapien_utils.look_at(
+            eye=[float(center_x), float(center_y) + 1e-3, 1.15],
+            target=[float(center_x), float(center_y), 0.0],
+        )
+        return [CameraConfig("base_camera", pose, 128, 128, 1.0, 0.01, 100)]
 
     @property
     def _default_human_render_camera_configs(self):
-        pose = sapien_utils.look_at(eye=[0.52, -0.50, 0.52], target=[0.20, 0.0, 0.05])
-        return CameraConfig("render_camera", pose, 1024, 1024, 1, 0.01, 100)
+        center_x, center_y = COMPACT_OPEN_TABLE_CENTER_XY
+        pose = sapien_utils.look_at(
+            eye=[float(center_x), float(center_y) + 1e-3, 1.25],
+            target=[float(center_x), float(center_y), 0.0],
+        )
+        return CameraConfig("render_camera", pose, 1024, 1024, 0.95, 0.01, 100)
 
     def _build_cylinder(self, idx: int):
         color = TARGET_COLOR if idx == self.target_idx else OBSTACLE_COLOR
@@ -237,19 +265,20 @@ class OpenTablePushEnv(TaskEnv):
         builder.initial_pose = sapien.Pose([0, 0, 1.0 + idx * 0.1])
         return builder.build(name=f"cyl_{idx}")
 
-    def _build_bottle(self, idx: int):
-        color = TARGET_COLOR if idx == self.target_idx else OBSTACLE_COLOR
+    def _build_bottle_actor(self, idx: int, color) -> object:
         builder = self.scene.create_actor_builder()
-        mat = sapien.render.RenderMaterial(base_color=color)
+        self._add_bottle_collision_geometry(builder)
+        self._add_bottle_visual_geometry(
+            builder, sapien.render.RenderMaterial(base_color=color)
+        )
+        builder.initial_pose = sapien.Pose([0, 0, 1.0 + idx * 0.1])
+        return builder.build(name=f"bottle_{idx}")
+
+    def _add_bottle_collision_geometry(self, builder) -> None:
         builder.add_cylinder_collision(
             radius=self.bottle_body_radius,
             half_length=self.bottle_body_half_length,
             density=self.object_density,
-        )
-        builder.add_cylinder_visual(
-            radius=self.bottle_body_radius,
-            half_length=self.bottle_body_half_length,
-            material=mat,
         )
         neck_pose = sapien.Pose([self.bottle_neck_offset, 0, 0])
         builder.add_cylinder_collision(
@@ -258,14 +287,6 @@ class OpenTablePushEnv(TaskEnv):
             half_length=self.bottle_neck_half_length,
             density=self.object_density * self.bottle_neck_density_scale,
         )
-        builder.add_cylinder_visual(
-            pose=neck_pose,
-            radius=self.bottle_neck_radius,
-            half_length=self.bottle_neck_half_length,
-            material=mat,
-        )
-        # Add an invisible lower ballast to lower the center of mass so pushes
-        # are more likely to slide the bottle instead of immediately tipping it.
         ballast_pose = sapien.Pose([-self.bottle_ballast_offset, 0, 0])
         builder.add_cylinder_collision(
             pose=ballast_pose,
@@ -273,8 +294,91 @@ class OpenTablePushEnv(TaskEnv):
             half_length=self.bottle_ballast_half_length,
             density=self.object_density * self.bottle_ballast_density_scale,
         )
-        builder.initial_pose = sapien.Pose([0, 0, 1.0 + idx * 0.1])
-        return builder.build(name=f"bottle_{idx}")
+
+    def _add_bottle_visual_geometry(self, builder, material) -> None:
+        if self.bottle_visual_style == "primitive":
+            builder.add_cylinder_visual(
+                radius=self.bottle_body_radius,
+                half_length=self.bottle_body_half_length,
+                material=material,
+            )
+            neck_pose = sapien.Pose([self.bottle_neck_offset, 0, 0])
+            builder.add_cylinder_visual(
+                pose=neck_pose,
+                radius=self.bottle_neck_radius,
+                half_length=self.bottle_neck_half_length,
+                material=material,
+            )
+            return
+        if self.bottle_visual_style != "ycb_mustard":
+            raise ValueError(
+                f"Unsupported bottle_visual_style={self.bottle_visual_style!r}"
+            )
+
+        scale = self._get_ycb_bottle_visual_scale(self.ycb_bottle_model_id)
+        mesh_pose = self._get_ycb_bottle_visual_pose(
+            self.ycb_bottle_model_id, scale=scale
+        )
+        mesh_path = (
+            Path(ASSET_DIR)
+            / "assets"
+            / "mani_skill2_ycb"
+            / "models"
+            / self.ycb_bottle_model_id
+            / "textured.obj"
+        )
+        builder.add_visual_from_file(
+            filename=str(mesh_path),
+            pose=mesh_pose,
+            scale=[scale] * 3,
+            material=material,
+        )
+
+    def _get_visual_footprint_radius(self) -> float:
+        radius = float(self.bottle_body_radius)
+        if self.bottle_visual_style != "ycb_mustard":
+            return radius
+        meta = _load_ycb_metadata(self.ycb_bottle_model_id)
+        bbox = meta["bbox"]
+        half_extent_x = max(
+            abs(float(bbox["min"][0])),
+            abs(float(bbox["max"][0])),
+        )
+        half_extent_y = max(
+            abs(float(bbox["min"][1])),
+            abs(float(bbox["max"][1])),
+        )
+        scale = self._get_ycb_bottle_visual_scale(self.ycb_bottle_model_id)
+        circumscribed_radius = scale * float(np.hypot(half_extent_x, half_extent_y))
+        return max(radius, circumscribed_radius)
+
+    def _get_ycb_bottle_visual_scale(self, model_id: str) -> float:
+        meta = _load_ycb_metadata(model_id)
+        bbox = meta["bbox"]
+        half_extent_xy = max(
+            abs(float(bbox["min"][0])),
+            abs(float(bbox["max"][0])),
+            abs(float(bbox["min"][1])),
+            abs(float(bbox["max"][1])),
+        )
+        if half_extent_xy <= 0:
+            raise ValueError(f"Invalid YCB bottle metadata for {model_id!r}")
+        return float(self.bottle_body_radius / half_extent_xy)
+
+    def _get_ycb_bottle_visual_pose(self, model_id: str, *, scale: float) -> sapien.Pose:
+        meta = _load_ycb_metadata(model_id)
+        bbox = meta["bbox"]
+        bottom_z = float(bbox["min"][2]) * scale
+        world_z_offset = -self.bottle_body_half_length - bottom_z
+        local_x_offset = world_z_offset
+        return sapien.Pose(
+            p=[local_x_offset, 0.0, 0.0],
+            q=qinverse(BOTTLE_UPRIGHT_Q),
+        )
+
+    def _build_bottle(self, idx: int):
+        color = TARGET_COLOR if idx == self.target_idx else OBSTACLE_COLOR
+        return self._build_bottle_actor(idx, color)
 
     def _build_object(self, idx: int):
         if self.object_kind == "bottle":
@@ -282,7 +386,7 @@ class OpenTablePushEnv(TaskEnv):
         return self._build_cylinder(idx)
 
     def _load_scene(self, options: dict):
-        self.table_scene = TableSceneBuilder(
+        self.table_scene = CompactOpenTableSceneBuilder(
             env=self, robot_init_qpos_noise=self.robot_init_qpos_noise
         )
         self.table_scene.build()

@@ -55,6 +55,23 @@ uv run python -m taskbench.run solver=open_table_push
 uv run python -m taskbench.run solver=open_table_push_horizontal
 ```
 
+### DenseRandomPush
+
+Dense open-table bottle clutter for large-scale push dataset generation. All bottles share the same physical parameters, scenes are created from a fast jittered tabletop grid, and the solver executes random pushes chosen from scene-generated launch corridors so the dataset stays cheap to generate. The default config is tuned as a reliable baseline at `2` bottles and `1` push per episode; increase `env.extra_kwargs.num_bottles` and `run.solver_kwargs.num_pushes` gradually as you retune the motion envelope for heavier clutter.
+
+```bash
+# Default dense clutter episode (1 push, no video)
+uv run python -m taskbench.run solver=dense_random_push
+
+# Scale up data collection
+uv run python -m taskbench.run solver=dense_random_push \
+  run.num_episodes=1000 env.record_video=false
+
+# Record a sample clutter episode with video
+uv run python -m taskbench.run solver=dense_random_push \
+  env.record_video=true run.solver_kwargs.num_pushes=4
+```
+
 ## Usage
 
 All commands use `uv run` — no manual venv activation needed.
@@ -71,6 +88,9 @@ uv run python -m taskbench.run solver=open_table_push
 
 # Record a single horizontal push offline (MP4 + HDF5)
 uv run python -m taskbench.run solver=open_table_push_horizontal
+
+# Collect a dense random-push dataset
+uv run python -m taskbench.run solver=dense_random_push run.num_episodes=1000
 
 # Replay a recorded demo
 uv run python -m taskbench.run solver=replay run.solver_kwargs.demo_path=data/success/episode_seed45.hdf5
