@@ -241,6 +241,94 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
         )
         return names, positions
 
+    def get_scene_spec(self) -> dict[str, object]:
+        object_names = [obj.name for obj in self.cylinders]
+        object_positions = np.stack(
+            [
+                obj.pose.p[0].detach().cpu().numpy().astype(np.float32)
+                for obj in self.cylinders
+            ],
+            axis=0,
+        )
+        object_quats = np.stack(
+            [
+                obj.pose.q[0].detach().cpu().numpy().astype(np.float32)
+                for obj in self.cylinders
+            ],
+            axis=0,
+        )
+        robot_root_position = (
+            self.agent.robot.pose.p[0].detach().cpu().numpy().astype(np.float32)
+        )
+        robot_root_quat = (
+            self.agent.robot.pose.q[0].detach().cpu().numpy().astype(np.float32)
+        )
+        robot_qpos = (
+            self.agent.robot.get_qpos()[0].detach().cpu().numpy().astype(np.float32)
+        )
+        workspace_lo, workspace_hi = self.get_workspace_bounds()
+        return {
+            "env_id": "OpenTableBottleClutter-v1",
+            "num_bottles": int(self.num_bottles),
+            "target_idx": int(self.target_idx),
+            "object_names": list(object_names),
+            "object_positions_xyz": object_positions,
+            "object_quats_wxyz": object_quats,
+            "robot_root_position_xyz": robot_root_position,
+            "robot_root_quat_wxyz": robot_root_quat,
+            "robot_qpos": robot_qpos,
+            "workspace_lo_xy": workspace_lo,
+            "workspace_hi_xy": workspace_hi,
+            "layout": self.get_scene_layout(),
+        }
+
+    def apply_scene_spec(self, scene_spec: dict[str, object]) -> None:
+        target_idx = int(scene_spec.get("target_idx", self.target_idx))
+        if target_idx != self.target_idx:
+            raise ValueError(
+                f"scene target_idx={target_idx} does not match env target_idx={self.target_idx}"
+            )
+
+        object_positions = np.asarray(
+            scene_spec["object_positions_xyz"], dtype=np.float32
+        )
+        object_quats = np.asarray(scene_spec["object_quats_wxyz"], dtype=np.float32)
+        if object_positions.shape != (self.num_bottles, 3):
+            raise ValueError(
+                "scene object_positions_xyz must have shape "
+                f"({self.num_bottles}, 3), got {object_positions.shape}"
+            )
+        if object_quats.shape != (self.num_bottles, 4):
+            raise ValueError(
+                "scene object_quats_wxyz must have shape "
+                f"({self.num_bottles}, 4), got {object_quats.shape}"
+            )
+
+        robot_root_position = np.asarray(
+            scene_spec["robot_root_position_xyz"], dtype=np.float32
+        )
+        robot_root_quat = np.asarray(
+            scene_spec["robot_root_quat_wxyz"], dtype=np.float32
+        )
+        robot_qpos = np.asarray(scene_spec["robot_qpos"], dtype=np.float32)
+
+        self.agent.robot.set_root_pose(
+            sapien.Pose(robot_root_position.tolist(), robot_root_quat.tolist())
+        )
+        robot_qpos_t = torch.as_tensor(
+            robot_qpos, dtype=torch.float32, device=self.device
+        ).reshape(1, -1)
+        self.agent.robot.set_qpos(robot_qpos_t)
+        if hasattr(self.agent.robot, "set_qvel"):
+            self.agent.robot.set_qvel(torch.zeros_like(robot_qpos_t))
+
+        for obj, position, quat in zip(self.cylinders, object_positions, object_quats):
+            obj.set_pose(sapien.Pose(position.tolist(), quat.tolist()))
+
+        _, self.initial_positions_xy = self.get_bottle_positions_xy()
+        layout = scene_spec.get("layout", {})
+        self.scene_layout = dict(layout) if isinstance(layout, dict) else {}
+
     def _sample_bottle_quaternion(self) -> np.ndarray:
         if not self.random_yaw:
             return np.asarray(BOTTLE_UPRIGHT_Q, dtype=np.float32)
