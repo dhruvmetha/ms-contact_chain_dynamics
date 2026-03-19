@@ -4,7 +4,7 @@ run:
   num_episodes: 1
   solver_kwargs:
     demo_path: null  # required: path to HDF5 demo file
-env:
+
+runtime:
   control_mode: pd_joint_pos
   num_envs: 1
-  reward_mode: sparse

@@ -1,0 +1,43 @@
+# @package _global_
+# Shelf retrieval — extract the red target cylinder from a cluttered shelf.
+#
+# The shelf is an enclosed box on legs, open toward the robot (-X face).
+# Inside: 19 blue cylinders + 1 red target. The robot reaches in from
+# the front to find and extract the red one.
+
+task:
+  env_id: ShelfEnv-v1
+
+  # Robot
+  robot_uids: ur5e_robotiq
+  robot_base_pose: [-0.56, 0.0, 0.0, 0, 0, 0, 1]  # [x, y, z, qw, qx, qy, qz]
+
+  # Objects — 1 red target + (num_objects - 1) blue distractors
+  num_objects: 20
+  cylinder:
+    radius: 0.018       # 3.6 cm diameter
+    half_length: 0.045  # 9 cm tall
+
+  # Shelf enclosure (meters) — open toward robot (-X face)
+  #
+  #   Top view:              Side view:
+  #
+  #        back wall              ┌── top ──┐
+  #   ┌────────────────┐         │  inner_h │
+  #   │  left   right  │         │          │
+  #   │  wall    wall   │         └── bot ──┘  ← floor_z
+  #   │                 │             │  │
+  #   └── front_x ─────┘            legs
+  #       (open face)
+  #
+  shelf:
+    front_x: 0.42       # front edge X position (open face, closest to robot)
+    depth: 0.30          # how deep the shelf extends away from robot (+X)
+    half_w: 0.50         # half-width (full shelf = 1.0 m wide)
+    floor_z: 0.55        # bottom board height above ground
+    thickness: 0.01      # board / wall thickness
+    inner_h: 0.50        # interior height (between bottom and top boards)
+
+runtime:
+  reward_mode: none
+  record_video: true

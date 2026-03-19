@@ -2,10 +2,7 @@
 run:
   solver: demo_recorder
   num_episodes: 1
-env:
-  env_id: StackNCube-v1
+
+runtime:
   control_mode: pd_joint_pos
   num_envs: 1
-  reward_mode: sparse
-  record_video: true
-  render_mode: rgb_array

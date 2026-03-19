@@ -37,19 +37,19 @@ class StackCubeDistractorEnv(StackCubeEnv):
         with torch.device(self.device):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
+            self._reset_robot(env_idx)
 
             xyz = torch.zeros((b, 3))
             xyz[:, 2] = 0.02
 
-            xy = torch.rand((b, 2)) * 0.2 - 0.1
             region = [[-0.1, -0.2], [0.1, 0.2]]
             sampler = randomization.UniformPlacementSampler(
                 bounds=region, batch_size=b, device=self.device
             )
             radius = torch.linalg.norm(torch.tensor([0.02, 0.02])) + 0.001
 
-            cubeA_xy = xy + sampler.sample(radius, 100)
-            cubeB_xy = xy + sampler.sample(radius, 100, verbose=False)
+            cubeA_xy = sampler.sample(radius, 100)
+            cubeB_xy = sampler.sample(radius, 100, verbose=False)
 
             # cubeA
             xyz[:, :2] = cubeA_xy
@@ -70,7 +70,7 @@ class StackCubeDistractorEnv(StackCubeEnv):
                 # Place right next to cubeA (4.5cm offset — nearly touching)
                 cubeC_xy = cubeA_xy + torch.tensor([0.045, 0.0])
             else:
-                cubeC_xy = xy + sampler.sample(radius, 100, verbose=False)
+                cubeC_xy = sampler.sample(radius, 100, verbose=False)
             xyz[:, :2] = cubeC_xy
             qs = randomization.random_quaternions(
                 b, lock_x=True, lock_y=True, lock_z=False

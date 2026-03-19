@@ -1,0 +1,10 @@
+# @package _global_
+# Stack N cubes into a tower.
+task:
+  env_id: StackNCube-v1
+  robot_uids: panda_wristcam
+  robot_base_pose: [-0.615, 0.0, 0.0]
+  num_cubes: 3
+
+runtime:
+  reward_mode: sparse

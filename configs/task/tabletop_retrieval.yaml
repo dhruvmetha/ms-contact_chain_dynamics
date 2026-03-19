@@ -1,0 +1,20 @@
+# @package _global_
+# Tabletop target retrieval — retrieve target from a row of bottles.
+task:
+  env_id: TabletopRetrieval-v1
+  robot_uids: panda
+  robot_base_pose: [-0.615, 0.0, 0.0]
+  row_origin_x: 0.16
+  row_origin_y: -0.06
+  row_angle_deg: 90.0
+  row_spacing: 0.05
+  lift_threshold: 0.05
+  object_kind: bottle
+  object_density: 1800.0
+  num_cylinders: 2
+
+runtime:
+  max_episode_steps: 320
+  reward_mode: none
+  record_video: true
+  render_mode: rgb_array

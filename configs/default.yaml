@@ -1,17 +1,16 @@
 defaults:
   - _self_
+  - task: default
   - solver: random
 
 seed: 42
 
-env:
-  env_id: StackNCube-v1
-  obs_mode: state
+runtime:
   control_mode: pd_ee_delta_pose
-  reward_mode: normalized_dense
+  obs_mode: state
+  reward_mode: none
   num_envs: 16
   max_episode_steps: 100
-  num_cubes: null
   record_video: false
   render_mode: rgb_array
 
@@ -21,4 +20,7 @@ logging:
   group: default
 
 run:
+  solver: random
+  mode: null      # null = auto-infer from solver name / batched flag
+  batched: false
   num_episodes: 100

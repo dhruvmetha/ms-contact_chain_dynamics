@@ -6,14 +6,15 @@ robot must reach in from the front, push blue cylinders aside, and extract
 the red one.  CPU-only, single-env.
 """
 
-from typing import Any, Union
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import sapien
 import sapien.render
 import torch
 
-from mani_skill.agents.robots import Panda
+
 from taskbench.envs.base import TaskEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
@@ -26,32 +27,52 @@ BLUE_COLOR = [0.20, 0.40, 0.85, 1.0]
 RED_COLOR = [0.90, 0.10, 0.10, 1.0]
 WOOD_COLOR = [0.55, 0.35, 0.10, 1.0]
 
-# ── Shelf geometry ──────────────────────────────────────────────────
-# Robot at origin faces +X.  Shelf sits in front, open toward -X.
-#
-#   Depth runs along +X (into the shelf, away from robot).
-#   Width runs along Y.
-#   Height runs along Z.
-#
-SHELF_FRONT_X = 0.42       # front edge X (closest to robot)
-SHELF_DEPTH = 0.30         # depth along +X
-SHELF_BACK_X = SHELF_FRONT_X + SHELF_DEPTH
-SHELF_CENTER_X = SHELF_FRONT_X + SHELF_DEPTH / 2
-SHELF_HALF_W = 0.50        # half-width along Y (100cm total)
-SHELF_FLOOR_Z = 0.55       # bottom board height above ground
-SHELF_T = 0.01             # board/wall thickness
-SHELF_SURFACE_Z = SHELF_FLOOR_Z + SHELF_T
-SHELF_INNER_H = 0.50       # interior height
-SHELF_CEIL_Z = SHELF_FLOOR_Z + 2 * SHELF_T + SHELF_INNER_H
-LEG_HEIGHT = SHELF_FLOOR_Z  # legs from ground to bottom board
-
-# ── Cylinders ───────────────────────────────────────────────────────
-NUM_OBJECTS = 20
-CYL_RADIUS = 0.018         # 3.6cm diameter
-CYL_HALF_LENGTH = 0.045    # 9cm tall upright
 CYL_UPRIGHT_Q = [0.7071068, 0, 0.7071068, 0]  # rotate +X axis -> +Z
 
-SUCCESS_LIFT_Z = SHELF_CEIL_Z + 0.05
+
+# ── Structured configs ──────────────────────────────────────────────
+
+@dataclass
+class ShelfGeometry:
+    """Shelf enclosure dimensions (meters)."""
+    front_x: float = 0.42       # front edge X (closest to robot)
+    depth: float = 0.30         # depth along +X
+    half_w: float = 0.50        # half-width along Y
+    floor_z: float = 0.55       # bottom board height above ground
+    thickness: float = 0.01     # board/wall thickness
+    inner_h: float = 0.50       # interior height
+
+    # Derived — computed in __post_init__
+    back_x: float = field(init=False)
+    center_x: float = field(init=False)
+    surface_z: float = field(init=False)
+    ceil_z: float = field(init=False)
+    leg_height: float = field(init=False)
+
+    def __post_init__(self):
+        self.back_x = self.front_x + self.depth
+        self.center_x = self.front_x + self.depth / 2
+        self.surface_z = self.floor_z + self.thickness
+        self.ceil_z = self.floor_z + 2 * self.thickness + self.inner_h
+        self.leg_height = self.floor_z
+
+
+@dataclass
+class CylinderSpec:
+    """Cylinder object dimensions."""
+    radius: float = 0.018       # 3.6cm diameter
+    half_length: float = 0.045  # 9cm tall
+
+
+@dataclass
+class ShelfTaskConfig:
+    """Top-level structured config for the shelf task."""
+    env_id: str = "ShelfEnv-v1"
+    robot_uids: str = "panda"
+    robot_base_pose: list[float] = field(default_factory=lambda: [-0.615, 0.0, 0.0])
+    num_objects: int = 20
+    shelf: ShelfGeometry = field(default_factory=ShelfGeometry)
+    cylinder: CylinderSpec = field(default_factory=CylinderSpec)
 
 
 @register_env("ShelfEnv-v1", max_episode_steps=300)
@@ -66,11 +87,12 @@ class ShelfEnv(TaskEnv):
         robot_uids: Robot to use (default: "panda").
     """
 
-    SUPPORTED_ROBOTS = ["panda"]
     SUPPORTED_REWARD_MODES = ["none"]
-    agent: Union[Panda]
 
-    def __init__(self, *args, robot_uids="panda", num_objects: int = NUM_OBJECTS, **kwargs):
+    def __init__(self, *args, robot_uids="panda", num_objects: int = 20,
+                 shelf=None, cylinder=None, **kwargs):
+        self.shelf_geom = ShelfGeometry(**(shelf or {}))
+        self.cyl_spec = CylinderSpec(**(cylinder or {}))
         self.num_objects = num_objects
         self.target_idx = 0
         super().__init__(
@@ -115,23 +137,24 @@ class ShelfEnv(TaskEnv):
         Each entry is a box: (str, [x,y,z], [hx,hy,hz]).
         Solvers can pass these to the motion planner as obstacles.
         """
-        cx = SHELF_CENTER_X
-        hw = SHELF_HALF_W
-        fz = SHELF_FLOOR_Z
-        ih = SHELF_INNER_H
-        t = SHELF_T
-        d = SHELF_DEPTH
+        g = self.shelf_geom
+        cx = g.center_x
+        hw = g.half_w
+        fz = g.floor_z
+        ih = g.inner_h
+        t = g.thickness
+        d = g.depth
 
         boxes = [
             ("shelf_bottom", [cx, 0, fz], [d / 2, hw, t]),
             ("shelf_top", [cx, 0, fz + 2 * t + ih], [d / 2, hw, t]),
-            ("shelf_back", [SHELF_BACK_X, 0, fz + t + ih / 2], [t, hw, ih / 2]),
+            ("shelf_back", [g.back_x, 0, fz + t + ih / 2], [t, hw, ih / 2]),
             ("shelf_left", [cx, -hw, fz + t + ih / 2], [d / 2, t, ih / 2]),
             ("shelf_right", [cx, hw, fz + t + ih / 2], [d / 2, t, ih / 2]),
         ]
 
         leg_r = 0.015
-        lh = LEG_HEIGHT / 2
+        lh = g.leg_height / 2
         for li, (dx, dy) in enumerate([(-d / 2 + 0.02, -hw + 0.02),
                                          (-d / 2 + 0.02, hw - 0.02),
                                          (d / 2 - 0.02, -hw + 0.02),
@@ -149,12 +172,13 @@ class ShelfEnv(TaskEnv):
         mat = sapien.render.RenderMaterial(base_color=WOOD_COLOR)
         parts = []
 
-        cx = SHELF_CENTER_X
-        hw = SHELF_HALF_W
-        fz = SHELF_FLOOR_Z
-        ih = SHELF_INNER_H
-        t = SHELF_T
-        d = SHELF_DEPTH
+        g = self.shelf_geom
+        cx = g.center_x
+        hw = g.half_w
+        fz = g.floor_z
+        ih = g.inner_h
+        t = g.thickness
+        d = g.depth
 
         def _box(name, center, half_size):
             b = self.scene.create_actor_builder()
@@ -168,7 +192,7 @@ class ShelfEnv(TaskEnv):
         # Top board (ceiling)
         _box("shelf_top", [cx, 0, fz + 2 * t + ih], [d / 2, hw, t])
         # Back wall (+X side, far from robot)
-        _box("shelf_back", [SHELF_BACK_X, 0, fz + t + ih / 2], [t, hw, ih / 2])
+        _box("shelf_back", [g.back_x, 0, fz + t + ih / 2], [t, hw, ih / 2])
         # Left wall (-Y)
         _box("shelf_left", [cx, -hw, fz + t + ih / 2], [d / 2, t, ih / 2])
         # Right wall (+Y)
@@ -176,7 +200,7 @@ class ShelfEnv(TaskEnv):
 
         # 4 legs
         leg_r = 0.015  # leg radius approximated as thin box
-        lh = LEG_HEIGHT / 2
+        lh = g.leg_height / 2
         for li, (dx, dy) in enumerate([(-d / 2 + 0.02, -hw + 0.02),
                                          (-d / 2 + 0.02, hw - 0.02),
                                          (d / 2 - 0.02, -hw + 0.02),
@@ -197,13 +221,15 @@ class ShelfEnv(TaskEnv):
         self.shelf_objects = []
         self.target_object = None
         if self.num_objects > 0:
+            r = self.cyl_spec.radius
+            hl = self.cyl_spec.half_length
             self.target_idx = self.np_random.integers(0, self.num_objects)
             for i in range(self.num_objects):
                 color = RED_COLOR if i == self.target_idx else BLUE_COLOR
                 cyl_mat = sapien.render.RenderMaterial(base_color=color)
                 builder = self.scene.create_actor_builder()
-                builder.add_cylinder_collision(radius=CYL_RADIUS, half_length=CYL_HALF_LENGTH)
-                builder.add_cylinder_visual(radius=CYL_RADIUS, half_length=CYL_HALF_LENGTH, material=cyl_mat)
+                builder.add_cylinder_collision(radius=r, half_length=hl)
+                builder.add_cylinder_visual(radius=r, half_length=hl, material=cyl_mat)
                 builder.initial_pose = sapien.Pose(p=[0, 0, 1.0 + i * 0.1])
                 self.shelf_objects.append(builder.build(name=f"cyl_{i}"))
             self.target_object = self.shelf_objects[self.target_idx]
@@ -213,14 +239,15 @@ class ShelfEnv(TaskEnv):
     # ------------------------------------------------------------------
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        self._reset_robot(env_idx)
         with torch.device(self.device):
-            # Scatter cylinders randomly inside the shelf
-            margin = CYL_RADIUS + 0.01
-            x_lo = SHELF_FRONT_X + margin
-            x_hi = SHELF_BACK_X - margin
-            y_lo = -SHELF_HALF_W + margin
-            y_hi = SHELF_HALF_W - margin
-            z = SHELF_SURFACE_Z + CYL_HALF_LENGTH
+            g = self.shelf_geom
+            margin = self.cyl_spec.radius + 0.01
+            x_lo = g.front_x + margin
+            x_hi = g.back_x - margin
+            y_lo = -g.half_w + margin
+            y_hi = g.half_w - margin
+            z = g.surface_z + self.cyl_spec.half_length
 
             for i, obj in enumerate(self.shelf_objects):
                 x = self.np_random.uniform(x_lo, x_hi)
@@ -233,14 +260,12 @@ class ShelfEnv(TaskEnv):
 
     def evaluate(self):
         if self.target_object is None:
-            success = False
+            success = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         else:
-            target_z = self.target_object.pose.p[0, 2].item()
-            success = target_z > SUCCESS_LIFT_Z
+            target_z = self.target_object.pose.p[:, 2]  # (N,)
+            success = target_z > self.shelf_geom.ceil_z + 0.05
         return {
-            "success": torch.tensor(
-                [success], device=self.device, dtype=torch.bool
-            ),
+            "success": success.to(dtype=torch.bool),
         }
 
     def _get_obs_extra(self, info: dict):
@@ -275,6 +300,7 @@ if __name__ == "__main__":
         num_envs=1,
         render_mode="human",
         robot_uids="panda",
+        robot_base_pose=[-0.615, 0, 0],
     )
     obs, _ = env.reset()
     for _ in range(300):

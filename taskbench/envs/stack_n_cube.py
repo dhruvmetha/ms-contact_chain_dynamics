@@ -4,12 +4,11 @@ Spawns N cubes (2-6) on the table with collision-free random placement.
 Success requires all N cubes stacked in a single ordered tower.
 """
 
-from typing import Union
 
 import numpy as np
 import sapien
 import torch
-from mani_skill.agents.robots import Fetch, Panda
+
 from taskbench.envs.base import TaskEnv
 from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
@@ -43,9 +42,7 @@ class StackNCubeEnv(TaskEnv):
         robot_init_qpos_noise: Noise added to robot initial joint positions.
     """
 
-    SUPPORTED_ROBOTS = ["panda_wristcam", "panda", "fetch"]
     SUPPORTED_REWARD_MODES = ["sparse", "none"]
-    agent: Union[Panda, Fetch]
 
     def __init__(
         self,
@@ -106,6 +103,7 @@ class StackNCubeEnv(TaskEnv):
         with torch.device(self.device):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
+            self._reset_robot(env_idx)
 
             xyz = torch.zeros((b, 3))
             xyz[:, 2] = 0.02  # half cube height above table

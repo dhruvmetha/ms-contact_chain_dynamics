@@ -5,14 +5,14 @@ A bin sits on the table filled with a mix of colorful primitive shapes
 mesh objects, gravity-settled each reset.  CPU-only, single-env.
 """
 
-from typing import Any, Union
+from typing import Any
 
 import numpy as np
 import sapien
 import sapien.render
 import torch
 
-from mani_skill.agents.robots import Panda
+
 from taskbench.envs.base import TaskEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
@@ -74,9 +74,7 @@ class BinWithObjectsEnv(TaskEnv):
         robot_uids: Robot to use (default: "panda").
     """
 
-    SUPPORTED_ROBOTS = ["panda"]
     SUPPORTED_REWARD_MODES = ["none"]
-    agent: Union[Panda]
 
     # Bin dimensions (interior half-sizes)
     BIN_BX = 0.20  # 40cm x-extent
@@ -209,10 +207,15 @@ class BinWithObjectsEnv(TaskEnv):
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
             self.table_scene.initialize(env_idx)
+            self._reset_robot(env_idx)
 
             # Move robot out of the way during settling
             self.agent.robot.set_root_pose(sapien.Pose(p=[-5, 0, 0]))
-            self.agent.reset(np.array([0, -1.5, 0, -2.5, 0, 1.0, 0.8, 0.04, 0.04]))
+            # Use keyframes from agent if available, else fall back to Panda defaults
+            agent_cls = type(self.unwrapped.agent if hasattr(self, "unwrapped") else self.agent)
+            _kf = getattr(agent_cls, "keyframes", {}).get("rest")
+            _rest_qpos = _kf.qpos if _kf is not None and _kf.qpos is not None else np.array([0, -1.5, 0, -2.5, 0, 1.0, 0.8, 0.04, 0.04])
+            self.agent.reset(_rest_qpos)
 
             # Place bin on table
             cx, cy = self.BIN_CENTER
@@ -259,9 +262,12 @@ class BinWithObjectsEnv(TaskEnv):
                     for _ in range(100):
                         self.scene.step()
 
-            # Move robot back and reset to default pose
-            self.agent.robot.set_root_pose(sapien.Pose(p=[-0.615, 0, 0]))
+            # Move robot back and re-initialize via TableSceneBuilder so
+            # that the controller, qpos, and qvel are properly reset after
+            # the settling phase moved the robot offstage.
+            self.agent.robot.set_root_pose(self._robot_base_sapien_pose())
             self.table_scene.initialize(env_idx)
+            self._reset_robot(env_idx)
 
     def evaluate(self):
         return {
@@ -292,6 +298,7 @@ if __name__ == "__main__":
         num_envs=1,
         render_mode="human",
         robot_uids="panda",
+        robot_base_pose=[-0.615, 0, 0],
     )
     obs, _ = env.reset()
     for _ in range(300):

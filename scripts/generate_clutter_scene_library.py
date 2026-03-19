@@ -32,10 +32,13 @@ from taskbench.envs.open_table_defaults import (BOTTLE_BODY_HALF_LENGTH,
                                                 PLACEMENT_CLEARANCE,
                                                 PLACEMENT_JITTER,
                                                 PLACEMENT_SPACING, RANDOM_YAW)
-from taskbench.envs.open_table_push import (BOTTLE_UPRIGHT_Q,
-                                            YCB_MUSTARD_BOTTLE_ID,
-                                            _load_ycb_metadata)
+from taskbench.envs.bottle_builder import (
+    BOTTLE_UPRIGHT_Q,
+    YCB_MUSTARD_BOTTLE_ID,
+    load_ycb_metadata,
+)
 from taskbench.envs.open_table_scene import (COMPACT_OPEN_TABLE_CENTER_XY,
+                                             COMPACT_OPEN_TABLE_HEIGHT,
                                              COMPACT_OPEN_TABLE_SIZE_XY)
 from taskbench.envs.placement import (build_rect_grid, clamp_jitter,
                                       jitter_positions, sample_frontier_cells)
@@ -135,6 +138,13 @@ def parse_args() -> argparse.Namespace:
         help="Render preview PNGs with the Panda moved offstage.",
     )
     parser.add_argument(
+        "--settle-steps",
+        type=int,
+        default=50,
+        help="Number of physics steps to run after reset before capturing "
+             "state/images (lets bottles settle under gravity).",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite an existing shard if present.",
@@ -205,6 +215,17 @@ def _use_algorithmic_scene_sampler(args: argparse.Namespace) -> bool:
     return (not _should_render(args)) and args.env_id == "OpenTableBottleClutter-v1"
 
 
+def _algorithmic_table_top_z() -> float:
+    """Compute table_top_z matching CompactOpenTableSceneBuilder.initialize().
+
+    ManiSkill's TableSceneBuilder.initialize() places the table actor at
+    z = -0.9196429 (its built-in default). The table collision box then
+    extends upward by the compact table height.
+    """
+    parent_table_z = -0.9196429
+    return parent_table_z + COMPACT_OPEN_TABLE_HEIGHT
+
+
 def _algorithmic_workspace_bounds() -> tuple[np.ndarray, np.ndarray]:
     center_xy = np.asarray(COMPACT_OPEN_TABLE_CENTER_XY, dtype=np.float32)
     half_extents_xy = 0.5 * np.asarray(
@@ -217,7 +238,7 @@ def _algorithmic_workspace_bounds() -> tuple[np.ndarray, np.ndarray]:
 
 def _algorithmic_visual_footprint_radius() -> float:
     radius = float(BOTTLE_BODY_RADIUS)
-    meta = _load_ycb_metadata(YCB_MUSTARD_BOTTLE_ID)
+    meta = load_ycb_metadata(YCB_MUSTARD_BOTTLE_ID)
     bbox = meta["bbox"]
     half_extent_x = max(abs(float(bbox["min"][0])), abs(float(bbox["max"][0])))
     half_extent_y = max(abs(float(bbox["min"][1])), abs(float(bbox["max"][1])))
@@ -274,12 +295,13 @@ def _sample_algorithmic_scene_spec(
         lo_xy=placement_lo_xy,
         hi_xy=placement_hi_xy,
     )
+    table_top_z = _algorithmic_table_top_z()
     positions_xyz = np.concatenate(
         [
             positions_xy,
             np.full(
                 (args.num_bottles, 1),
-                BOTTLE_BODY_HALF_LENGTH,
+                table_top_z + BOTTLE_BODY_HALF_LENGTH,
                 dtype=np.float32,
             ),
         ],
@@ -392,6 +414,7 @@ def _init_env(args: argparse.Namespace):
         reward_mode="none",
         render_mode=render_mode,
         sim_backend="cpu",
+        robot_base_pose=[-0.615, 0, 0],
         num_bottles=args.num_bottles,
         layout_mode=args.layout_mode,
     )
@@ -438,7 +461,8 @@ def main() -> None:
             return
         raise RuntimeError(
             f"Detected partial shard state for {shard_stem}: "
-            f"hdf5_exists={shard_exists}, manifest_exists={manifest_exists}"
+            f"hdf5_exists={shard_exists}, manifest_exists={manifest_exists}. "
+            f"Re-run with --overwrite to regenerate this shard."
         )
 
     lock_fd = _acquire_shard_lock(lock_path)
@@ -525,6 +549,10 @@ def main() -> None:
                         scene_spec = _sample_algorithmic_scene_spec(args, seed=seed)
                     else:
                         env.reset(seed=seed)
+                        if args.settle_steps > 0:
+                            action = env.action_space.sample() * 0
+                            for _ in range(args.settle_steps):
+                                env.step(action)
                         scene_spec = raw.get_scene_spec()
                     names = list(scene_spec["object_names"])
                     positions = np.asarray(

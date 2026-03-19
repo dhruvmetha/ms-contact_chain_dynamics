@@ -18,8 +18,12 @@ from taskbench.envs.open_table_defaults import (
     BOTTLE_NECK_OFFSET_BASE, BOTTLE_NECK_RADIUS_BASE, BOTTLE_SCALE,
     DENSE_LAYOUT_PROB, EDGE_MARGIN, MIXED_LAYOUT_PROB, PANDA_TABLE_DEFAULTS,
     PLACEMENT_CLEARANCE, PLACEMENT_JITTER, PLACEMENT_SPACING)
-from taskbench.envs.open_table_push import (BOTTLE_UPRIGHT_Q, TARGET_COLOR,
-                                            OpenTablePushEnv)
+from taskbench.envs.bottle_builder import (
+    BOTTLE_UPRIGHT_Q,
+    build_bottle_actor,
+    get_visual_footprint_radius,
+)
+from taskbench.envs.open_table_env import TARGET_COLOR, OpenTableEnv
 from taskbench.envs.open_table_scene import (COMPACT_OPEN_TABLE_CENTER_XY,
                                              COMPACT_OPEN_TABLE_SIZE_XY)
 from taskbench.envs.placement import (PlacementGrid, build_rect_grid,
@@ -32,10 +36,10 @@ BOTTLE_COLOR = [0.20, 0.40, 0.85, 1.0]
 @register_env(
     "OpenTableBottleClutter-v1", max_episode_steps=1400, asset_download_ids=["ycb"]
 )
-class OpenTableBottleClutterEnv(OpenTablePushEnv):
+class OpenTableBottleClutterEnv(OpenTableEnv):
     """Open table with many bottles placed from a fast clutter sampler.
 
-    The env keeps the bottle physics from ``OpenTablePushEnv`` but switches
+    The env keeps the bottle physics from ``OpenTableEnv`` but switches
     placement from a short deterministic row to a full-table lattice. A
     lightweight frontier sampler chooses occupied lattice cells so some scenes
     are clustered and others are more diffuse without relying on expensive
@@ -100,10 +104,6 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
         )
         kwargs.setdefault("object_kind", "bottle")
         kwargs.setdefault("num_cylinders", num_bottles)
-        kwargs.setdefault("push_axis", "x")
-        kwargs.setdefault("push_angle_deg", 0.0)
-        kwargs.setdefault("wrist_orientation", "vertical")
-        kwargs.setdefault("use_staging", False)
 
         self.num_bottles = int(num_bottles)
         self.use_full_table_workspace = bool(use_full_table_workspace)
@@ -148,6 +148,9 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
 
         super().__init__(*args, **kwargs)
         self.initial_positions_xy = np.zeros((self.num_bottles, 2), dtype=np.float32)
+        self.initial_positions_xy_batched = torch.zeros(
+            self.num_envs, self.num_bottles, 2, device=self.device
+        )
         self.launch_corridors: list[dict[str, object]] = []
         self.scene_layout: dict[str, object] = {}
 
@@ -182,7 +185,7 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
             self._workspace_lo_xy,
             self._workspace_hi_xy,
         ) = self._workspace_bounds_from_config()
-        footprint_margin = self.edge_margin + self._get_visual_footprint_radius()
+        footprint_margin = self.edge_margin + get_visual_footprint_radius(self.obj)
         self._placement_lo_xy = self._workspace_lo_xy + footprint_margin
         self._placement_hi_xy = self._workspace_hi_xy - footprint_margin
         if np.any(self._placement_hi_xy < self._placement_lo_xy):
@@ -209,7 +212,7 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
 
     def _build_bottle(self, idx: int):
         color = TARGET_COLOR if idx == self.target_idx else BOTTLE_COLOR
-        return self._build_bottle_actor(idx, color)
+        return build_bottle_actor(self.scene, self.obj, idx, color)
 
     def get_objects(self) -> dict[str, object]:
         return {obj.name: obj for obj in self.cylinders}
@@ -248,6 +251,7 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
         )
 
     def get_bottle_positions_xy(self) -> tuple[list[str], np.ndarray]:
+        """Return bottle XY positions for env 0 (single-env helper)."""
         names = [obj.name for obj in self.cylinders]
         positions = np.stack(
             [
@@ -257,6 +261,12 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
             axis=0,
         )
         return names, positions
+
+    def _bottle_positions_xy_batched(self) -> torch.Tensor:
+        """Return bottle XY positions for all envs. Shape: (N, num_bottles, 2)."""
+        return torch.stack(
+            [obj.pose.p[:, :2] for obj in self.cylinders], dim=1
+        )
 
     def get_scene_spec(self) -> dict[str, object]:
         object_names = [obj.name for obj in self.cylinders]
@@ -342,6 +352,7 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
         for obj, position, quat in zip(self.cylinders, object_positions, object_quats):
             obj.set_pose(sapien.Pose(position.tolist(), quat.tolist()))
 
+        self.initial_positions_xy_batched = self._bottle_positions_xy_batched()
         _, self.initial_positions_xy = self.get_bottle_positions_xy()
         layout = scene_spec.get("layout", {})
         self.scene_layout = dict(layout) if isinstance(layout, dict) else {}
@@ -359,24 +370,35 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
 
         with torch.device(self.device):
             self.table_scene.initialize(env_idx)
+            self._reset_robot(env_idx)
 
             # Validate that ManiSkill's scene builder still places the robot
             # where we expect.  The algorithmic scene sampler in
             # generate_clutter_scene_library.py bakes these values into HDF5
             # files, so a silent upstream change would corrupt generated data.
-            _actual_pos = self.agent.robot.pose.p[0].detach().cpu().numpy()
-            _actual_qpos = self.agent.robot.get_qpos()[0].detach().cpu().numpy()
-            assert np.allclose(
-                _actual_pos, PANDA_TABLE_DEFAULTS.root_position, atol=1e-3
-            ), (
-                f"Robot root pose drifted from expected {PANDA_TABLE_DEFAULTS.root_position}: "
-                f"got {_actual_pos.tolist()}"
-            )
-            assert np.allclose(
-                _actual_qpos, PANDA_TABLE_DEFAULTS.home_qpos, atol=1e-3
-            ), f"Robot home qpos drifted from expected: got {_actual_qpos.tolist()}"
+            # Only applies to the Panda robot — other robots have different defaults.
+            # Only validate on full resets (env_idx covers all envs) to avoid
+            # reading env 0 state during a partial reset of a different env.
+            _is_panda = getattr(self.agent, "uid", "") in ("panda", "panda_wristcam")
+            _is_full_reset = len(env_idx) == self.num_envs
+            if _is_panda and _is_full_reset:
+                _actual_pos = self.agent.robot.pose.p[0].detach().cpu().numpy()
+                _actual_qpos = self.agent.robot.get_qpos()[0].detach().cpu().numpy()
+                if not np.allclose(
+                    _actual_pos, PANDA_TABLE_DEFAULTS.root_position, atol=1e-3
+                ):
+                    raise RuntimeError(
+                        f"Robot root pose drifted from expected "
+                        f"{PANDA_TABLE_DEFAULTS.root_position}: got {_actual_pos.tolist()}"
+                    )
+                if not np.allclose(
+                    _actual_qpos, PANDA_TABLE_DEFAULTS.home_qpos, atol=1e-3
+                ):
+                    raise RuntimeError(
+                        f"Robot home qpos drifted from expected: got {_actual_qpos.tolist()}"
+                    )
 
-            z = self.bottle_body_half_length
+            z = self._get_table_top_z() + self.obj.body_half_length
             self.launch_corridors = []
 
             occupied_indices, layout_meta = sample_frontier_cells(
@@ -401,6 +423,7 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
                 q = self._sample_bottle_quaternion()
                 self.cylinders[idx].set_pose(sapien.Pose([xy[0], xy[1], z], q))
 
+            self.initial_positions_xy_batched = self._bottle_positions_xy_batched()
             _, self.initial_positions_xy = self.get_bottle_positions_xy()
             self.scene_layout = {
                 **layout_meta,
@@ -409,22 +432,16 @@ class OpenTableBottleClutterEnv(OpenTablePushEnv):
             }
 
     def evaluate(self):
-        _, current_xy = self.get_bottle_positions_xy()
-        deltas = current_xy - self.initial_positions_xy
-        displacement = np.linalg.norm(deltas, axis=1)
-        max_displacement = float(displacement.max()) if len(displacement) else 0.0
-        moved_bottles = int(
-            np.count_nonzero(displacement > self.movement_success_threshold)
-        )
-        success = max_displacement > self.movement_success_threshold
+        current_xy = self._bottle_positions_xy_batched()  # (N, B, 2)
+        deltas = current_xy - self.initial_positions_xy_batched  # (N, B, 2)
+        displacement = torch.linalg.norm(deltas, dim=-1)  # (N, B)
+        max_displacement = displacement.max(dim=-1).values  # (N,)
+        moved_bottles = (displacement > self.movement_success_threshold).sum(dim=-1)  # (N,)
+        success = max_displacement > self.movement_success_threshold  # (N,)
         return {
-            "success": torch.tensor([success], device=self.device, dtype=torch.bool),
-            "max_displacement": torch.tensor(
-                [max_displacement], device=self.device, dtype=torch.float32
-            ),
-            "moved_bottles": torch.tensor(
-                [moved_bottles], device=self.device, dtype=torch.int32
-            ),
+            "success": success.to(dtype=torch.bool),
+            "max_displacement": max_displacement.to(dtype=torch.float32),
+            "moved_bottles": moved_bottles.to(dtype=torch.int32),
         }
 
     def _get_obs_extra(self, info: dict):
