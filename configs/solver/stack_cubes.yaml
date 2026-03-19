@@ -1,9 +1,9 @@
 # @package _global_
+# Cube stacking solver.
+#   uv run python -m taskbench.run task=stack_cubes solver=stack_cubes
 run:
   solver: stack_cubes
-env:
-  env_id: StackNCube-v1
+
+runtime:
   control_mode: pd_joint_pos
   num_envs: 1
-  reward_mode: sparse
-  num_cubes: 3

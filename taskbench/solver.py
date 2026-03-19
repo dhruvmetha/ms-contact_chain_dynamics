@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
@@ -21,6 +22,9 @@ class BaseSolver(ABC):
     num_envs, etc.) are declared in the solver's Hydra config group YAML, not here.
     """
 
+    #: Solver name used in recording filenames. Defaults to the registry name.
+    solver_name: str = "solver"
+
     @abstractmethod
     def solve(self, env, seed=None, cfg=None) -> SolverResult:
         """Run the solver on a single raw gym env.
@@ -35,6 +39,23 @@ class BaseSolver(ABC):
             SolverResult with success status, reward, and info dict.
         """
         ...
+
+    def save_recording(self, recorder, seed, result, *, cfg=None,
+                       output_dir="data"):
+        """Save a state recording to ``output_dir/success/`` or ``output_dir/failure/``."""
+        tag = "success" if result.success else "failure"
+        path = os.path.join(output_dir, tag)
+        os.makedirs(path, exist_ok=True)
+        recorder.save(
+            os.path.join(path, f"{self.solver_name}_seed{seed}.hdf5"),
+            metadata={
+                "seed": seed,
+                "solver": self.solver_name,
+                "success": result.success,
+                "failure_reason": result.failure_reason or "",
+            },
+            hydra_cfg=cfg,
+        )
 
 
 SOLVER_REGISTRY: dict[str, type] = {}
@@ -59,6 +80,7 @@ def register_solver(name: str):
             )
         if name in SOLVER_REGISTRY:
             raise ValueError(f"Solver {name!r} already registered")
+        cls.solver_name = name
         SOLVER_REGISTRY[name] = cls
         return cls
 

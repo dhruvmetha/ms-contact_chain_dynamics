@@ -1,0 +1,18 @@
+# @package _global_
+# GPU-batched push data collection with cuRobo.
+#   uv run python -m taskbench.run task=tabletop_retrieval solver=batched_contact_push
+run:
+  solver: batched_contact_push
+  batched: true
+  num_episodes: 100
+  solver_kwargs:
+    push_distance: 0.10
+    approach_gap: 0.06
+    lift_height: 0.08
+    settle_steps: 8
+    push_randomization: true
+    interpolation_dt: 0.02
+
+runtime:
+  control_mode: pd_joint_pos
+  num_envs: 256

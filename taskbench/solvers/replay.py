@@ -3,14 +3,14 @@
 Usage:
     uv run python -m taskbench.run solver=replay \\
         run.solver_kwargs.demo_path=data/success/episode_seed45.hdf5 \\
-        env.num_cubes=5
+        task.num_cubes=5
 
     # With video recording:
     uv run python -m taskbench.run solver=replay \\
         run.solver_kwargs.demo_path=data/success/episode_seed45.hdf5 \\
-        env.num_cubes=5 env.record_video=true
+        task.num_cubes=5 runtime.record_video=true
 
-Note: env.num_cubes must match the demo. The solver will raise a clear
+Note: task.num_cubes must match the demo. The solver will raise a clear
 error if objects are missing.
 """
 
@@ -20,6 +20,7 @@ import logging
 import h5py
 import numpy as np
 import sapien
+from omegaconf import OmegaConf
 
 from taskbench.skills.context import SkillContext
 from taskbench.solver import BaseSolver, SolverResult, register_solver
@@ -61,7 +62,40 @@ class ReplaySolver(BaseSolver):
     def __init__(self, demo_path: str):
         self.demo_path = demo_path
 
+    def apply_demo_config(self, cfg):
+        """Merge task config from the demo HDF5 into the running config.
+
+        Forwards all task keys from the demo so the env matches the demo.
+        Call this before env creation.
+        """
+        if not self.demo_path:
+            return
+        with h5py.File(self.demo_path, "r") as f:
+            hydra_yaml = f["metadata"].attrs.get("hydra_config", "")
+            if isinstance(hydra_yaml, bytes):
+                hydra_yaml = hydra_yaml.decode()
+            if not hydra_yaml:
+                return
+            demo_cfg = OmegaConf.create(hydra_yaml)
+
+        # Forward all task.* keys from the demo config.
+        # Fall back to legacy env.* for old recordings.
+        demo_task = OmegaConf.select(demo_cfg, "task", default=None)
+        if demo_task is None:
+            demo_task = OmegaConf.select(demo_cfg, "env", default=None)
+        if demo_task is None:
+            return
+        for key in demo_task:
+            val = OmegaConf.select(demo_task, key)
+            if val is not None:
+                OmegaConf.update(cfg, f"task.{key}", val)
+
     def solve(self, env, seed=None, cfg=None) -> SolverResult:
+        if not self.demo_path:
+            raise ValueError(
+                "demo_path is required for ReplaySolver. "
+                "Pass run.solver_kwargs.demo_path=<path>"
+            )
         with h5py.File(self.demo_path, "r") as f:
             meta = f["metadata"].attrs
             demo_seed = int(meta["seed"])
@@ -73,6 +107,11 @@ class ReplaySolver(BaseSolver):
                 demo_config_yaml = demo_config_yaml.decode()
             # Read num_cubes from objects group
             demo_num_cubes = len(f["objects"]) if "objects" in f else None
+            if "program" not in f or "program/skill" not in f:
+                logger.error("Demo %s has no recorded skill calls", self.demo_path)
+                return SolverResult(
+                    success=False, failure_reason="empty_demo"
+                )
             skill_names = [s.decode() if isinstance(s, bytes) else s
                            for s in f["program/skill"]]
             skill_args = [s.decode() if isinstance(s, bytes) else s
@@ -83,7 +122,7 @@ class ReplaySolver(BaseSolver):
         if demo_env_id and actual_env_id and demo_env_id != actual_env_id:
             raise ValueError(
                 f"Demo was recorded on {demo_env_id} but env is {actual_env_id}. "
-                f"Override with env.env_id={demo_env_id}"
+                f"Override with task.env_id={demo_env_id}"
             )
 
         if demo_config_yaml:
@@ -110,7 +149,7 @@ class ReplaySolver(BaseSolver):
         if demo_objects:
             missing = demo_objects - set(ctx.objects.keys())
             if missing:
-                hint = f"env.num_cubes={demo_num_cubes}" if demo_num_cubes else ""
+                hint = f"task.num_cubes={demo_num_cubes}" if demo_num_cubes else ""
                 raise ValueError(
                     f"Demo requires objects {sorted(missing)} not found in env. "
                     f"Env has {sorted(ctx.objects.keys())}. "

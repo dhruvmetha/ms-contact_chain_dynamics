@@ -7,40 +7,44 @@ from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 import taskbench.envs  # noqa: F401 — register custom envs
 
 
-def _env_kwargs(cfg):
-    """Extract extra keyword arguments for gym.make from the env config."""
-    kwargs = dict(OmegaConf.select(cfg, "extra_kwargs", default={}) or {})
-    num_cubes = OmegaConf.select(cfg, "num_cubes", default=None)
-    if num_cubes is not None:
-        kwargs["num_cubes"] = num_cubes
-    return kwargs
+def _task_kwargs(cfg):
+    """Extract env constructor kwargs from the task config.
+
+    Everything under ``cfg.task`` except ``env_id`` is forwarded to the
+    env constructor as **kwargs.  Uses ``to_container()`` to cleanly
+    convert nested structured configs to plain dicts.
+    """
+    container = OmegaConf.to_container(cfg.task, resolve=True)
+    container.pop("env_id", None)
+    return container
 
 
 def make_env(cfg):
     """Create a vectorized ManiSkill env with optional video recording."""
-    need_render = cfg.record_video or cfg.render_mode == "human"
-    render_mode = cfg.render_mode if need_render else None
+    rt = cfg.runtime
+    need_render = rt.record_video or rt.render_mode == "human"
+    render_mode = rt.render_mode if need_render else None
 
-    kwargs = _env_kwargs(cfg)
+    kwargs = _task_kwargs(cfg)
 
     env = gym.make(
-        cfg.env_id,
-        obs_mode=cfg.obs_mode,
-        control_mode=cfg.control_mode,
-        reward_mode=cfg.reward_mode,
-        num_envs=cfg.num_envs,
-        max_episode_steps=cfg.max_episode_steps,
+        cfg.task.env_id,
+        obs_mode=rt.obs_mode,
+        control_mode=rt.control_mode,
+        reward_mode=rt.reward_mode,
+        num_envs=rt.num_envs,
+        max_episode_steps=rt.max_episode_steps,
         render_mode=render_mode,
         **kwargs,
     )
 
-    if cfg.record_video and cfg.render_mode != "human":
+    if rt.record_video and rt.render_mode != "human":
         env = RecordEpisode(
             env,
             output_dir="videos",
             save_trajectory=False,
             save_video=True,
-            max_steps_per_video=cfg.max_episode_steps,
+            max_steps_per_video=rt.max_episode_steps,
         )
 
     env = ManiSkillVectorEnv(env, auto_reset=True, record_metrics=True)
@@ -50,28 +54,28 @@ def make_env(cfg):
 def make_single_env(cfg):
     """Create a single raw gym env for use with the motion planner.
 
-    Forces ``num_envs=1`` and ignores the vectorized wrapper so that
-    ``PandaArmMotionPlanningSolver`` can access ``env.unwrapped`` attributes
-    directly.
+    Forces ``num_envs=1`` and ``sim_backend="cpu"`` so that mplib can
+    access ``env.unwrapped`` attributes directly.
     """
-    need_render = cfg.record_video or cfg.render_mode == "human"
-    render_mode = cfg.render_mode if need_render else None
+    rt = cfg.runtime
+    need_render = rt.record_video or rt.render_mode == "human"
+    render_mode = rt.render_mode if need_render else None
 
-    kwargs = _env_kwargs(cfg)
+    kwargs = _task_kwargs(cfg)
 
     env = gym.make(
-        cfg.env_id,
-        obs_mode=cfg.obs_mode,
-        control_mode=cfg.control_mode,
-        reward_mode=cfg.reward_mode,
+        cfg.task.env_id,
+        obs_mode=rt.obs_mode,
+        control_mode=rt.control_mode,
+        reward_mode=rt.reward_mode,
         num_envs=1,
-        max_episode_steps=cfg.max_episode_steps,
+        max_episode_steps=rt.max_episode_steps,
         render_mode=render_mode,
         sim_backend="cpu",
         **kwargs,
     )
 
-    if cfg.record_video and cfg.render_mode != "human":
+    if rt.record_video and rt.render_mode != "human":
         env = RecordEpisode(
             env,
             output_dir="videos",

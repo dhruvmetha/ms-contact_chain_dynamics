@@ -61,17 +61,23 @@ def _unwrap_env(env_or_raw):
     return env_or_raw.unwrapped if hasattr(env_or_raw, "unwrapped") else env_or_raw
 
 
+_DRIVE_SCALAR_WARNED: set[str] = set()
+
+
 def _drive_value_as_scalar(value, *, name):
     """Convert a controller drive parameter to a representative scalar."""
     arr = np.asarray(value, dtype=np.float64).reshape(-1)
     if arr.size == 0:
         raise ValueError(f"Controller drive parameter {name!r} is empty")
     if arr.size > 1 and not np.allclose(arr, arr[0]):
-        logger.warning(
-            "Controller drive parameter %s varies per joint; using the first value %.3f",
-            name,
-            arr[0],
-        )
+        if name not in _DRIVE_SCALAR_WARNED:
+            _DRIVE_SCALAR_WARNED.add(name)
+            logger.warning(
+                "Controller drive parameter %s varies per joint;"
+                " using the first value %.3f",
+                name,
+                arr[0],
+            )
     return float(arr[0])
 
 
@@ -266,9 +272,11 @@ def _sample_collision_shape_points(shape):
 
 def get_gripper_collision_points_in_tcp(agent):
     """Sample the gripper collision geometry in the TCP frame."""
-    from taskbench.skills.robot_config import ROBOT_CONFIGS
+    from taskbench.skills.robot_config import _discover_config, _BUILTIN_CONFIGS
 
-    robot_config = ROBOT_CONFIGS.get(agent.uid)
+    robot_config = _discover_config(agent.uid)
+    if robot_config is None:
+        robot_config = _BUILTIN_CONFIGS.get(agent.uid)
     if robot_config is None:
         raise KeyError(f"No RobotConfig for robot {agent.uid!r}")
 
@@ -286,6 +294,11 @@ def get_gripper_collision_points_in_tcp(agent):
         if link is None:
             continue
         world_link = _pose_matrix(link.pose.p[0], link.pose.q[0])
+        if not hasattr(link, "_objs") or not link._objs:
+            raise AttributeError(
+                f"Link {link_name!r} has no '_objs' attribute. "
+                "This uses a private ManiSkill/SAPIEN API — check your ManiSkill version."
+            )
         body = link._objs[0]
         for shape in body.get_collision_shapes():
             local_shape = shape.get_local_pose()
@@ -471,7 +484,13 @@ def get_arm_controller(env):
 
 
 def get_arm_drive_settings(env):
-    """Read the active arm controller drive settings as scalars."""
+    """Read the active arm controller drive settings.
+
+    Returns both scalar summaries (first-element representative values for
+    reporting) and raw config values that may be per-joint arrays.  The
+    ``_*_raw`` keys preserve the original config type so callers can scale
+    proportionally without destroying per-joint differentiation.
+    """
     arm_controller = get_arm_controller(env)
     if arm_controller is None:
         return None
@@ -480,20 +499,27 @@ def get_arm_drive_settings(env):
         "stiffness": _drive_value_as_scalar(cfg.stiffness, name="stiffness"),
         "damping": _drive_value_as_scalar(cfg.damping, name="damping"),
         "force_limit": _drive_value_as_scalar(cfg.force_limit, name="force_limit"),
+        "_stiffness_raw": cfg.stiffness,
+        "_damping_raw": cfg.damping,
+        "_force_limit_raw": cfg.force_limit,
     }
 
 
 def set_arm_drive_settings(env, *, stiffness=None, damping=None, force_limit=None):
-    """Update the active arm controller drive settings in-place."""
+    """Update the active arm controller drive settings in-place.
+
+    Accepts scalars or per-joint arrays/tuples.  ``set_drive_property()``
+    uses ``np.broadcast_to`` internally so both forms work.
+    """
     arm_controller = get_arm_controller(env)
     if arm_controller is None:
         raise RuntimeError("Active control mode does not expose an arm controller")
     if stiffness is not None:
-        arm_controller.config.stiffness = float(stiffness)
+        arm_controller.config.stiffness = stiffness
     if damping is not None:
-        arm_controller.config.damping = float(damping)
+        arm_controller.config.damping = damping
     if force_limit is not None:
-        arm_controller.config.force_limit = float(force_limit)
+        arm_controller.config.force_limit = force_limit
     arm_controller.set_drive_property()
 
 
@@ -702,9 +728,9 @@ def get_gripper_contact_summary(env, robot_config: RobotConfig | None = None):
     """
     raw = _unwrap_env(env)
     if robot_config is None:
-        from taskbench.skills.robot_config import ROBOT_CONFIGS
+        from taskbench.skills.robot_config import get_robot_config
 
-        robot_config = ROBOT_CONFIGS[raw.agent.uid]
+        robot_config = get_robot_config(env)
 
     peak_force = 0.0
     total_force = 0.0
@@ -733,8 +759,8 @@ def _record_motion_diagnostics(env, robot_config: RobotConfig, diagnostics):
         return
 
     raw = env.unwrapped
-    qf = raw.agent.robot.get_qf()[0].cpu().numpy()
-    joint_load = raw.agent.robot.get_link_incoming_joint_forces().cpu().numpy()
+    qf = raw.agent.robot.get_qf()[0].detach().cpu().numpy()
+    joint_load = raw.agent.robot.get_link_incoming_joint_forces().detach().cpu().numpy()
     contact = get_gripper_contact_summary(raw, robot_config)
 
     diagnostics.setdefault("joint_effort_samples", []).append(qf.copy())
@@ -800,8 +826,8 @@ def follow_path(env, result, gripper_state, robot_config: RobotConfig,
             return None
     n_step = result["position"].shape[0]
     if n_step == 0:
-        logger.warning("Planned path has zero waypoints; treating as a no-op")
-        return None, 0.0, False, False, {}
+        logger.warning("Planned path has zero waypoints; treating as planning failure")
+        return None
     has_velocity = "velocity" in result
     for i in range(n_step + refine_steps):
         idx = min(i, n_step - 1)

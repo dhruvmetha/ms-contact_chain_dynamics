@@ -308,6 +308,10 @@ class Place(Skill):
         if not result.success:
             return PlaceResult(success=False, failure_reason="place_move_failed")
 
+        # Save step_result from the place move — the retract may fail, so
+        # this is the last guaranteed-good observation.
+        place_step_result = result.step_result
+
         # Release gripper
         actuate_gripper(env, planner, rc.gripper_open,
                         step_callback=self.step_callback)
@@ -330,7 +334,10 @@ class Place(Skill):
         if not result.success:
             logger.warning("Retract failed, continuing anyway")
 
-        return PlaceResult(success=True, step_result=result.step_result)
+        return PlaceResult(
+            success=True,
+            step_result=result.step_result if result.success else place_step_result,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -405,8 +412,21 @@ class Push(Skill):
                 push_distance=push_distance,
                 planar_push_distance=planar_push_distance,
             )
+        base_force_limit_raw = base_drive["_force_limit_raw"]
         arm_force_limit_start = base_drive["force_limit"] * effort_scale
         arm_force_limit_end = base_drive["force_limit"] * effort_scale_end
+
+        # Common fields for all early-exit PushResults.
+        base = dict(
+            approach_pose=approach_pose,
+            push_pose=push_pose,
+            push_distance=push_distance,
+            planar_push_distance=planar_push_distance,
+            effort_scale_start=effort_scale,
+            effort_scale_end=effort_scale_end,
+            arm_force_limit_start=arm_force_limit_start,
+            arm_force_limit_end=arm_force_limit_end,
+        )
 
         # Optional pre-stage. Useful for vertical pushes that should descend
         # straight down to the contact start pose.
@@ -417,18 +437,7 @@ class Push(Skill):
                 time_step_scale=staging_speed_scale,
             )
             if not result.success:
-                return PushResult(
-                    success=False,
-                    failure_reason="staging_move_failed",
-                    approach_pose=approach_pose,
-                    push_pose=push_pose,
-                    push_distance=push_distance,
-                    planar_push_distance=planar_push_distance,
-                    effort_scale_start=effort_scale,
-                    effort_scale_end=effort_scale_end,
-                    arm_force_limit_start=arm_force_limit_start,
-                    arm_force_limit_end=arm_force_limit_end,
-                )
+                return PushResult(success=False, failure_reason="staging_move_failed", **base)
 
         if hover_pose is not None:
             result = move(
@@ -437,18 +446,7 @@ class Push(Skill):
                 time_step_scale=hover_speed_scale,
             )
             if not result.success:
-                return PushResult(
-                    success=False,
-                    failure_reason="hover_move_failed",
-                    approach_pose=approach_pose,
-                    push_pose=push_pose,
-                    push_distance=push_distance,
-                    planar_push_distance=planar_push_distance,
-                    effort_scale_start=effort_scale,
-                    effort_scale_end=effort_scale_end,
-                    arm_force_limit_start=arm_force_limit_start,
-                    arm_force_limit_end=arm_force_limit_end,
-                )
+                return PushResult(success=False, failure_reason="hover_move_failed", **base)
 
         # Lift from current position for clearance when requested.
         if clearance_height > 0:
@@ -462,18 +460,7 @@ class Push(Skill):
             )
             result = move(clearance_pose, time_step_scale=clearance_speed_scale)
             if not result.success:
-                return PushResult(
-                    success=False,
-                    failure_reason="clearance_lift_failed",
-                    approach_pose=approach_pose,
-                    push_pose=push_pose,
-                    push_distance=push_distance,
-                    planar_push_distance=planar_push_distance,
-                    effort_scale_start=effort_scale,
-                    effort_scale_end=effort_scale_end,
-                    arm_force_limit_start=arm_force_limit_start,
-                    arm_force_limit_end=arm_force_limit_end,
-                )
+                return PushResult(success=False, failure_reason="clearance_lift_failed", **base)
 
         # Close gripper for the actual push surface after free-space transit.
         actuate_gripper(env, planner, rc.gripper_closed,
@@ -486,27 +473,15 @@ class Push(Skill):
             time_step_scale=approach_speed_scale,
         )
         if not result.success:
-            return PushResult(
-                success=False,
-                failure_reason="approach_failed",
-                approach_pose=approach_pose,
-                push_pose=push_pose,
-                push_distance=push_distance,
-                planar_push_distance=planar_push_distance,
-                effort_scale_start=effort_scale,
-                effort_scale_end=effort_scale_end,
-                arm_force_limit_start=arm_force_limit_start,
-                arm_force_limit_end=arm_force_limit_end,
-            )
+            return PushResult(success=False, failure_reason="approach_failed", **base)
 
         # Sweep — closed gripper, contact monitoring off (contact is intentional)
         diagnostics = {}
         def _push_effort_hook(progress, _idx, _num_steps):
-            force_limit = arm_force_limit_start + (
-                arm_force_limit_end - arm_force_limit_start
-            ) * progress
+            scale = effort_scale + (effort_scale_end - effort_scale) * progress
+            force_limit = np.asarray(base_force_limit_raw) * scale
             diagnostics.setdefault("commanded_force_limit_samples", []).append(
-                float(force_limit)
+                float(np.max(np.asarray(force_limit)))
             )
             set_arm_drive_settings(env, force_limit=force_limit)
 
@@ -523,23 +498,12 @@ class Push(Skill):
         finally:
             set_arm_drive_settings(
                 env,
-                stiffness=base_drive["stiffness"],
-                damping=base_drive["damping"],
-                force_limit=base_drive["force_limit"],
+                stiffness=base_drive["_stiffness_raw"],
+                damping=base_drive["_damping_raw"],
+                force_limit=base_drive["_force_limit_raw"],
             )
         if not result.success:
-            return PushResult(
-                success=False,
-                failure_reason="push_failed",
-                approach_pose=approach_pose,
-                push_pose=push_pose,
-                push_distance=push_distance,
-                planar_push_distance=planar_push_distance,
-                effort_scale_start=effort_scale,
-                effort_scale_end=effort_scale_end,
-                arm_force_limit_start=arm_force_limit_start,
-                arm_force_limit_end=arm_force_limit_end,
-            )
+            return PushResult(success=False, failure_reason="push_failed", **base)
 
         # Lift to disengage when requested — gripper stays closed to avoid snagging.
         if lift_height > 0:

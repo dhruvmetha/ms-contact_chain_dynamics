@@ -1,0 +1,6 @@
+# @package _global_
+# Default task — N-cube stacking on a table.
+task:
+  env_id: StackNCube-v1
+  robot_uids: panda_wristcam
+  robot_base_pose: [-0.615, 0.0, 0.0]

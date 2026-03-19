@@ -19,6 +19,20 @@ COMPACT_OPEN_TABLE_LEG_THICKNESS = 0.055
 class CompactOpenTableSceneBuilder(TableSceneBuilder):
     """Smaller open table with the same robot initialization as ManiSkill's default."""
 
+    table_top_z: float = 0.0  # Set by initialize(), safe for GPU-batched envs
+
+    def initialize(self, env_idx):
+        super().initialize(env_idx)
+        # The parent sets the table actor pose to z = -<default_table_height>.
+        # The collision box has a local z offset of our_height/2 and half_size
+        # of our_height/2, so the table top in world frame is:
+        #   actor_z + local_offset + half_size = actor_z + our_height
+        # We can't read actor_z from the GPU scene (pose not committed yet),
+        # so we read it from the parent's known constant.
+        # parent initialize() uses: Pose(p=[-0.12, 0, -0.9196429])
+        parent_table_z = -0.9196429
+        self.table_top_z = parent_table_z + self.table_height
+
     def build(self):
         size_x, size_y = COMPACT_OPEN_TABLE_SIZE_XY
         height = COMPACT_OPEN_TABLE_HEIGHT

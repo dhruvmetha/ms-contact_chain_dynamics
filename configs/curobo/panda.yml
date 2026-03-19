@@ -1,0 +1,30 @@
+# cuRobo robot configuration mapping for Panda (Franka Emika).
+#
+# cuRobo ships a built-in franka.yml that includes collision spheres,
+# self-collision pairs, and joint limits. This file maps our robot names
+# to the cuRobo built-in and stores taskbench-specific overrides.
+
+# cuRobo built-in config filename (resolved by cuRobo's asset path)
+curobo_config: "franka.yml"
+
+# Arm joint names as used by ManiSkill / SAPIEN
+arm_joint_names:
+  - panda_joint1
+  - panda_joint2
+  - panda_joint3
+  - panda_joint4
+  - panda_joint5
+  - panda_joint6
+  - panda_joint7
+
+# Gripper joints are locked during motion planning
+locked_joints:
+  panda_finger_joint1: 0.04
+  panda_finger_joint2: 0.04
+
+# End-effector link used for IK targets
+ee_link: "panda_hand_tcp"
+
+# Default interpolation timestep (seconds) for trajectory generation.
+# Should match env.control_timestep for 1:1 waypoint-to-step mapping.
+interpolation_dt: 0.02

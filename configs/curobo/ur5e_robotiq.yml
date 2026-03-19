@@ -1,0 +1,30 @@
+# cuRobo robot configuration mapping for UR5e + Robotiq 2F-85.
+#
+# Uses cuRobo's built-in ur5e.yml for the arm (collision spheres, joint
+# limits, self-collision pairs). The Robotiq gripper joints are locked
+# during motion planning — the gripper is controlled separately.
+#
+# Note: cuRobo's ur5e.yml covers only the 6-DOF arm. For push tasks this
+# is sufficient since the gripper pose is static during contact. For future
+# pick/place tasks, a custom config with gripper collision spheres would
+# be needed.
+
+curobo_config: "ur5e.yml"
+
+arm_joint_names:
+  - shoulder_pan_joint
+  - shoulder_lift_joint
+  - elbow_joint
+  - wrist_1_joint
+  - wrist_2_joint
+  - wrist_3_joint
+
+# Robotiq gripper joints are not part of the cuRobo planning chain.
+# They are locked at closed position during push tasks.
+locked_joints:
+  right_driver_joint: 0.0
+  left_driver_joint: 0.0
+
+ee_link: "eef"
+
+interpolation_dt: 0.02

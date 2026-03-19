@@ -90,7 +90,7 @@ def _extract_gripper_contact_force(raw):
 
 def _extract_joint_load_l2(raw):
     """Return an aggregate internal joint-load proxy for the current step."""
-    incoming = raw.agent.robot.get_link_incoming_joint_forces().cpu().numpy()
+    incoming = raw.agent.robot.get_link_incoming_joint_forces().detach().cpu().numpy()
     return float(np.linalg.norm(incoming))
 
 
@@ -102,14 +102,14 @@ def _extract_arm_force_limit(raw):
 
 # Each extractor takes (raw_env,) and returns an array-like value.
 _ROBOT_FIELD_EXTRACTORS = {
-    "qpos": lambda raw: raw.agent.robot.get_qpos()[0].cpu().numpy(),
-    "qvel": lambda raw: raw.agent.robot.get_qvel()[0].cpu().numpy(),
-    "qf": lambda raw: raw.agent.robot.get_qf()[0].cpu().numpy(),
+    "qpos": lambda raw: raw.agent.robot.get_qpos()[0].detach().cpu().numpy(),
+    "qvel": lambda raw: raw.agent.robot.get_qvel()[0].detach().cpu().numpy(),
+    "qf": lambda raw: raw.agent.robot.get_qf()[0].detach().cpu().numpy(),
     "arm_force_limit": _extract_arm_force_limit,
     "joint_load_l2": _extract_joint_load_l2,
-    "tcp_pos": lambda raw: raw.agent.tcp.pose.p[0].cpu().numpy(),
-    "tcp_quat": lambda raw: raw.agent.tcp.pose.q[0].cpu().numpy(),
-    "gripper_qpos": lambda raw: raw.agent.robot.get_qpos()[0].cpu().numpy()[-2:],
+    "tcp_pos": lambda raw: raw.agent.tcp.pose.p[0].detach().cpu().numpy(),
+    "tcp_quat": lambda raw: raw.agent.tcp.pose.q[0].detach().cpu().numpy(),
+    "gripper_qpos": lambda raw: raw.agent.robot.get_qpos()[0].detach().cpu().numpy()[-2:],
     "gripper_contact_force": _extract_gripper_contact_force,
 }
 
@@ -206,8 +206,8 @@ class StateRecorder:
 
         # Tracked object poses
         for name, actor in self.objects.items():
-            frame[f"{name}_pos"] = actor.pose.p[0].cpu().numpy()
-            frame[f"{name}_quat"] = actor.pose.q[0].cpu().numpy()
+            frame[f"{name}_pos"] = actor.pose.p[0].detach().cpu().numpy()
+            frame[f"{name}_quat"] = actor.pose.q[0].detach().cpu().numpy()
 
         self.frames.append(frame)
 

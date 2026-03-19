@@ -44,7 +44,7 @@ class SkillContext:
 
     def __init__(self, env, *, step_callback: Optional[Callable] = None):
         self.env = env
-        self.step_callback = step_callback
+        self._step_callback = step_callback
         self.robot_config: RobotConfig = get_robot_config(env)
         self.planner = None
         self.objects: dict[str, object] = {}
@@ -56,9 +56,28 @@ class SkillContext:
         self.push: Push = _proxy  # type: ignore[assignment]
         self.move: Move = _proxy  # type: ignore[assignment]
 
+    @property
+    def step_callback(self) -> Optional[Callable]:
+        return self._step_callback
+
+    @step_callback.setter
+    def step_callback(self, value: Optional[Callable]):
+        self._step_callback = value
+        for skill in (self.pick, self.place, self.push, self.move):
+            if not isinstance(skill, _SkillProxy):
+                skill.step_callback = value
+
     def reset(self, seed=None):
         """Reset the env and rebuild planner, objects, and skills."""
         self.env.reset(seed=seed)
+        self.initialize()
+
+    def initialize(self):
+        """Set up planner, objects, and skills from current env state.
+
+        Use this after the env has already been reset externally (e.g. by
+        a search-based solver that manages its own resets).
+        """
         self.planner = setup_planner(self.env, self.robot_config)
         self.objects = get_objects(self.env)
         self._build_skills()
@@ -68,7 +87,7 @@ class SkillContext:
         kw = dict(
             robot_config=self.robot_config,
             objects=self.objects,
-            step_callback=self.step_callback,
+            step_callback=self._step_callback,
         )
         self.pick = Pick(self.env, self.planner, **kw)
         self.place = Place(self.env, self.planner, **kw)

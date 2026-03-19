@@ -36,22 +36,15 @@ class ShelfReachabilitySolver(BaseSolver):
         raw = env.unwrapped
         rc = get_robot_config(env)
 
-        # Get shelf geometry
-        from taskbench.envs.shelf_env import (
-            SHELF_BACK_X,
-            SHELF_CEIL_Z,
-            SHELF_FRONT_X,
-            SHELF_HALF_W,
-            SHELF_SURFACE_Z,
-        )
-
+        # Get shelf geometry from env instance
+        g = raw.shelf_geom
         boxes = raw.get_collision_boxes()
 
         # Grid resolution — finer Z sampling to find the reachable band
         nx, ny, nz = 5, 7, 8
-        xs = np.linspace(SHELF_FRONT_X + 0.03, SHELF_BACK_X - 0.03, nx)
-        ys = np.linspace(-SHELF_HALF_W + 0.03, SHELF_HALF_W - 0.03, ny)
-        zs = np.linspace(SHELF_SURFACE_Z + 0.03, SHELF_CEIL_Z - 0.03, nz)
+        xs = np.linspace(g.front_x + 0.03, g.back_x - 0.03, nx)
+        ys = np.linspace(-g.half_w + 0.03, g.half_w - 0.03, ny)
+        zs = np.linspace(g.surface_z + 0.03, g.ceil_z - 0.03, nz)
 
         total = nx * ny * nz
         reachable = 0

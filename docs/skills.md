@@ -184,15 +184,22 @@ class SkillResult:
 
 ## RobotConfig
 
-Robot-specific constants (move group, finger length, gripper links) are stored in `RobotConfig`, not hardcoded:
+Robot-specific constants (move group, finger length, gripper links) are stored in `RobotConfig`, not hardcoded. Configs are discovered automatically — custom agents declare a `taskbench_config` class attribute, while ManiSkill built-in robots use a fallback table:
 
 ```python
-from taskbench.skills.robot_config import ROBOT_CONFIGS
+from taskbench.skills.robot_config import get_robot_config
 
-ROBOT_CONFIGS = {
-    "panda": RobotConfig(move_group="panda_hand_tcp", finger_length=0.025, ...),
-    "panda_wristcam": RobotConfig(...),
-}
+# Auto-discovered from agent class or built-in fallback
+cfg = get_robot_config(env)  # returns RobotConfig for the active robot
+```
+
+Custom agents declare their config directly on the class:
+
+```python
+@register_agent()
+class MyRobot(BaseAgent):
+    taskbench_config = RobotConfig(move_group="eef", finger_length=0.035, ...)
+    table_scene_base_pose = sapien.Pose([-0.56, 0, 0])
 ```
 
 `SkillContext` auto-detects the robot from `env.unwrapped.agent.uid`.

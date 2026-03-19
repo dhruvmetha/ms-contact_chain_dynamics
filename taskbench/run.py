@@ -19,8 +19,8 @@ def seed_everything(seed: int):
 
 def run_random(config, logger: Logger):
     """Run episodes with random actions using the vectorized env."""
-    env = make_env(config.env)
-    num_envs = config.env.num_envs
+    env = make_env(config)
+    num_envs = config.runtime.num_envs
     target_episodes = config.run.num_episodes
 
     episodes_done = 0
@@ -37,7 +37,7 @@ def run_random(config, logger: Logger):
         actions = env.action_space.sample()
         obs, rewards, terminations, truncations, infos = env.step(actions)
 
-        if config.env.render_mode == "human":
+        if config.runtime.render_mode == "human":
             env.render()
 
         if isinstance(rewards, torch.Tensor):
@@ -87,54 +87,79 @@ def run_random(config, logger: Logger):
     return all_returns, all_lengths, all_successes
 
 
-def _apply_demo_config(config):
-    """If solver is replay with a demo_path, merge env config from the demo."""
-    solver_kwargs = OmegaConf.select(config.run, "solver_kwargs", default={}) or {}
-    demo_path = solver_kwargs.get("demo_path") if isinstance(solver_kwargs, dict) else OmegaConf.select(solver_kwargs, "demo_path", default=None)
-    if not demo_path:
-        return
-
-    import h5py
-    with h5py.File(demo_path, "r") as f:
-        hydra_yaml = f["metadata"].attrs.get("hydra_config", "")
-        if isinstance(hydra_yaml, bytes):
-            hydra_yaml = hydra_yaml.decode()
-        if not hydra_yaml:
-            return
-        demo_cfg = OmegaConf.create(hydra_yaml)
-
-    # Merge env-specific fields from the demo into the current config
-    for key in ("env_id", "num_cubes"):
-        val = OmegaConf.select(demo_cfg, f"env.{key}", default=None)
-        if val is not None:
-            OmegaConf.update(config, f"env.{key}", val)
-
-
-def run_solver(config, logger: Logger):
-    """Run episodes with a registered solver (motion planner)."""
+def run_batched(config, logger: Logger):
+    """Run episodes with a batched solver using GPU-vectorized envs and cuRobo."""
     from taskbench.solver import get_solver
-
-    # For replay solver, auto-configure env from demo metadata
-    if config.run.solver == "replay":
-        _apply_demo_config(config)
 
     solver_kwargs = OmegaConf.select(config.run, "solver_kwargs", default={}) or {}
     solver = get_solver(config.run.solver, **solver_kwargs)
 
-    env = make_single_env(config.env)
+    env = make_env(config)
+    recording = config.runtime.record_video
     target_episodes = config.run.num_episodes
 
     all_returns = []
     all_lengths = []
     all_successes = []
 
-    recording = config.env.record_video
-
     for ep in range(1, target_episodes + 1):
         result = solver.solve(env, seed=config.seed + ep, cfg=config)
 
-        raw = env.unwrapped
-        result.success = bool(raw.evaluate()["success"].item())
+        if recording:
+            # ManiSkillVectorEnv._env is the RecordEpisode wrapper
+            inner = env._env if hasattr(env, "_env") else env
+            if hasattr(inner, "flush_video"):
+                inner.flush_video()
+
+        all_returns.append(result.reward)
+        all_lengths.append(result.elapsed_steps)
+        all_successes.append(result.success)
+
+        logger.log_episode(
+            {
+                "episode/return": result.reward,
+                "episode/length": result.elapsed_steps,
+                "episode/success": int(result.success),
+            },
+            step=ep,
+        )
+
+        n_success = result.info.get("n_success", 0)
+        n_total = result.info.get("n_total", 0)
+        rate = result.info.get("success_rate", 0.0)
+        print(
+            f"[Episode {ep}/{target_episodes}]  "
+            f"batch_success={n_success}/{n_total}  "
+            f"rate={rate:.2f}"
+        )
+
+    env.close()
+    return all_returns, all_lengths, all_successes
+
+
+def run_solver(config, logger: Logger):
+    """Run episodes with a registered solver (motion planner)."""
+    from taskbench.solver import get_solver
+
+    solver_kwargs = OmegaConf.select(config.run, "solver_kwargs", default={}) or {}
+    solver = get_solver(config.run.solver, **solver_kwargs)
+
+    # Let the solver patch config before env creation (e.g. replay solver
+    # merges task config from the demo HDF5).
+    if hasattr(solver, "apply_demo_config"):
+        solver.apply_demo_config(config)
+
+    env = make_single_env(config)
+    target_episodes = config.run.num_episodes
+
+    all_returns = []
+    all_lengths = []
+    all_successes = []
+
+    recording = config.runtime.record_video
+
+    for ep in range(1, target_episodes + 1):
+        result = solver.solve(env, seed=config.seed + ep, cfg=config)
 
         if recording:
             env.flush_video()
@@ -156,9 +181,13 @@ def run_solver(config, logger: Logger):
         extras = []
         if result.failure_reason:
             extras.append(f"failure_reason={result.failure_reason}")
-        for k in ("cubes_stacked",):
-            if k in result.info and result.info[k]:
-                extras.append(f"{k}={result.info[k]}")
+        for k, v in result.info.items():
+            # Guard against tensor truthiness (ambiguous for multi-element)
+            try:
+                if v:
+                    extras.append(f"{k}={v}")
+            except (RuntimeError, ValueError):
+                extras.append(f"{k}={v}")
 
         rate = np.mean(all_successes)
         extra_str = "  " + "  ".join(extras) if extras else ""
@@ -173,11 +202,24 @@ def main(cfg: DictConfig) -> None:
     seed_everything(cfg.seed)
     logger = Logger(cfg)
 
-    solver_name = cfg.run.solver
-    if solver_name == "random":
+    mode = OmegaConf.select(cfg.run, "mode", default=None)
+    if mode is None:
+        # Infer mode from solver name and flags for backward compat
+        if cfg.run.solver == "random":
+            mode = "random"
+        elif OmegaConf.select(cfg.run, "batched", default=False):
+            mode = "batched"
+        else:
+            mode = "single"
+
+    if mode == "random":
         all_returns, all_lengths, all_successes = run_random(cfg, logger)
-    else:
+    elif mode == "batched":
+        all_returns, all_lengths, all_successes = run_batched(cfg, logger)
+    elif mode == "single":
         all_returns, all_lengths, all_successes = run_solver(cfg, logger)
+    else:
+        raise ValueError(f"Unknown run.mode={mode!r}; expected 'single', 'batched', or 'random'")
 
     # Summary
     summary = {

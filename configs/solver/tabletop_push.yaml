@@ -1,0 +1,30 @@
+# @package _global_
+# Push-based retrieval strategy.
+#   uv run python -m taskbench.run task=tabletop_retrieval solver=tabletop_push
+run:
+  solver: tabletop_push
+  num_episodes: 1
+  solver_kwargs:
+    wrist_orientation: vertical
+    tool_spin_deg: 0.0
+    table_clearance: 0.006
+    push_height_offset: 0.0
+    approach_gap: 0.06
+    end_margin: 0.05
+    use_staging: true
+    staging_height: 0.18
+    staging_backoff: 0.0
+    clearance_height: 0.0
+    lift_height: 0.0
+    effort_scale: 0.25
+    effort_scale_end: 0.75
+    min_contact_force: 0.01
+    staging_speed_scale: 1.0
+    hover_speed_scale: 1.0
+    approach_speed_scale: 1.0
+    push_speed_scale: 1.0
+    settle_steps: 8
+
+runtime:
+  control_mode: pd_joint_pos
+  num_envs: 1

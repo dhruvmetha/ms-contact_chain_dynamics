@@ -15,7 +15,8 @@ class Logger:
                 group=cfg.logging.group,
                 config={
                     "seed": cfg.seed,
-                    "env": OmegaConf.to_container(cfg.env, resolve=True),
+                    "task": OmegaConf.to_container(cfg.task, resolve=True),
+                    "runtime": OmegaConf.to_container(cfg.runtime, resolve=True),
                     "run": OmegaConf.to_container(cfg.run, resolve=True),
                 },
             )

@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["black", "isort"]
+curobo = ["nvidia-curobo @ git+https://github.com/NVlabs/curobo.git"]
 
 [tool.setuptools.packages.find]
 include = ["taskbench*"]

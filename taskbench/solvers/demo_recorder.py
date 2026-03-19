@@ -1,8 +1,8 @@
 """Interactive demo recorder: compose skill programs by clicking cubes in the SAPIEN viewer.
 
 Usage:
-    uv run python -m taskbench.run solver=demo_recorder env.env_id=StackNCube-v1 \
-        +env.extra_kwargs.num_cubes=3 run.num_episodes=1
+    uv run python -m taskbench.run solver=demo_recorder task.env_id=StackNCube-v1 \
+        task.num_cubes=3 run.num_episodes=1
 
 Keyboard shortcuts:
     Click  — select a cube in the viewer
@@ -182,6 +182,9 @@ class DemoRecorderSolver(BaseSolver):
                     if target_cube is None:
                         print("[!] Click the target cube first")
                         continue
+                    if not hasattr(raw, "cube_half_size"):
+                        print("[!] Place requires cube_half_size (only available in cube-stacking envs)")
+                        continue
                     print(f"[place] Placing on {target_name}...")
                     cube_height = (raw.cube_half_size[2] * 2).item()
                     _, _, pick_result = held_cube
@@ -334,4 +337,6 @@ class DemoRecorderSolver(BaseSolver):
 
         info = raw.evaluate()
         success = bool(info["success"].item())
-        return SolverResult(success=success, info=dict(info))
+        # Convert tensors to Python scalars so run.py can print them safely
+        scalar_info = {k: v.item() if hasattr(v, "item") else v for k, v in info.items()}
+        return SolverResult(success=success, info=scalar_info)

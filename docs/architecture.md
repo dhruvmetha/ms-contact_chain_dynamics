@@ -5,61 +5,104 @@ Taskbench is a robotics research testbed for evaluating solvers on ManiSkill3 ma
 ## Directory Structure
 
 ```
+configs/
+  default.yaml                      # Base Hydra config (seed, runtime, logging, run)
+  task/                             # Task config group (what: scene, objects, success)
+    open_table_push.yaml
+    stack_cubes.yaml
+  solver/                           # Solver config group (how: trajectory, execution)
+    open_table_push.yaml
+    stack_cubes.yaml
+
 taskbench/                          # Core framework
   run.py                            # Entry point (@hydra.main)
-  solver.py                         # BaseSolver ABC, SolverResult, @register_solver, auto-discovery
+  solver.py                         # BaseSolver ABC, SolverResult, @register_solver
   recorder.py                       # StateRecorder for episode capture (HDF5)
+  batched_recorder.py               # GPU-batched recording for vectorized envs
   logger.py                         # WandB logging wrapper
   envs/
-    base.py                         # TaskEnv — base class with get_objects()
-    factory.py                      # make_env() / make_single_env()
+    base.py                         # TaskEnv — base class (get_objects, get_push_task)
+    factory.py                      # make_env(cfg) / make_single_env(cfg)
     __init__.py                     # get_objects() dispatch + env registration
+    open_table_push.py              # OpenTablePush-v1 (push row of bottles)
+    open_table_bottle_clutter.py    # OpenTableBottleClutter-v1 (dense bottle clutter)
+    open_table_scene.py             # Shared compact table scene builder
     stack_n_cube.py                 # StackNCube-v1 (parameterized N-cube)
     stack_cube_distractor.py        # StackCubeDistractor-v1 (2-cube + distractor)
     shelf_env.py                    # ShelfEnv-v1 (enclosed shelf with cylinders)
     bin_with_objects.py             # BinWithObjects-v1 (bin of primitives + YCB)
-    open_table_bottle_clutter.py    # OpenTableBottleClutter-v1 (dense bottle clutter)
   skills/
-    robot_config.py                 # RobotConfig dataclass + registry
     context.py                      # SkillContext — bundles env + planner + skills
-    motion.py                       # Low-level mplib helpers
-    primitives.py                   # Composable skill objects (Pick, Place, etc.)
-
+    primitives.py                   # Composable skill objects (Pick, Place, Push, Move)
+    motion.py                       # Low-level mplib helpers (plan_screw, follow_path)
+    robot_config.py                 # RobotConfig dataclass + auto-discovery
+    batched_context.py              # BatchedSkillContext (cuRobo, GPU-parallel)
+    batched_primitives.py           # BatchedMove, BatchedPush (GPU-parallel)
+    curobo_motion.py                # GPU-batched planning with cuRobo
+    curobo_world.py                 # Collision world setup for cuRobo
   solvers/
-    stack_n_cubes.py                # StackCubesSolver (@register_solver)
-    replay.py                       # ReplaySolver (@register_solver)
-    demo_recorder.py                # DemoRecorderSolver (@register_solver)
-    shelf_reachability.py           # ShelfReachabilitySolver (@register_solver)
-    dense_random_push.py            # DenseRandomPushSolver (@register_solver)
-
-configs/
-  default.yaml                      # Default Hydra config (YAML-only, no Python dataclasses)
-  solver/                           # Hydra config group (one YAML per solver)
-    random.yaml
-    stack_cubes.yaml
-    replay.yaml
-    demo_recorder.yaml
-    shelf_reachability.yaml
+    open_table_push.py              # OpenTablePushSolver — single-env mplib push
+    batched_contact_push.py         # BatchedContactPushSolver — GPU-batched cuRobo push
+    stack_n_cubes.py                # StackCubesSolver — sequential pick-place
+    replay.py                       # ReplaySolver — replay HDF5 demos
+    demo_recorder.py                # DemoRecorderSolver — interactive viewer
+    shelf_reachability.py           # ShelfReachabilitySolver — grid sweep
+  agents/
+    ur5e_robotiq.py                 # UR5e + Robotiq 2F-85 agent
+    __init__.py                     # Agent discovery (pkgutil)
 ```
+
+## Config Structure
+
+Three config sections, three concerns:
+
+```yaml
+task:       # what's in the world (env_id, objects, layout, success criterion)
+  env_id: OpenTablePush-v1
+  push_axis: y
+  num_cylinders: 2
+
+runtime:    # how to run the simulation (control mode, parallelism, recording)
+  control_mode: pd_joint_pos
+  num_envs: 1
+  record_video: true
+
+run:        # what solver to use and its parameters
+  solver: open_table_push
+  solver_kwargs:
+    wrist_orientation: vertical
+    approach_gap: 0.06
+```
+
+Two config groups compose independently:
+
+```bash
+uv run python -m taskbench.run task=open_table_push solver=open_table_push
+uv run python -m taskbench.run task=open_table_push_x solver=open_table_push_horizontal
+uv run python -m taskbench.run task=open_table_push_ur5e solver=open_table_push
+```
+
+Override any param from CLI:
+
+```bash
+task.num_cylinders=5       # task params (flat, no nesting)
+task.bottle_body_half_length=0.08
+task.scene_file=layouts.json
+run.solver_kwargs.effort_scale=0.5
+runtime.record_video=false
+```
+
+---
 
 ## Core Flow
 
 `taskbench/run.py` is the entry point (`@hydra.main`). It dispatches based on `cfg.run.solver`:
 
-- `"random"` -> `run_random()` — creates a vectorized env via `make_env()`, samples random actions
-- Any other value -> `run_solver()` — looks up the solver via `get_solver()`, creates a single CPU env via `make_single_env()`, calls `solver.solve()` per episode
+- `"random"` → `run_random()` — creates a vectorized env via `make_env()`, samples random actions
+- `batched` flag → `run_batched()` — GPU-vectorized env, cuRobo planner
+- Any other value → `run_solver()` — auto-discovers solver, creates a single CPU env, calls `solver.solve()` per episode
 
-```bash
-uv run python -m taskbench.run                                      # random baseline
-uv run python -m taskbench.run solver=stack_cubes                   # registered solver
-uv run python -m taskbench.run solver=stack_cubes env.num_cubes=4
-```
-
----
-
-## Skills
-
-See [docs/skills.md](skills.md) for full documentation of all skills, parameters, and return types.
+The runner owns the episode loop. The solver owns everything inside an episode — resets, planning, execution, evaluation.
 
 ---
 
@@ -77,32 +120,50 @@ class TaskEnv(BaseEnv, metaclass=ABCMeta):
     def get_objects(self) -> dict[str, object]:
         """Return a name -> actor mapping for all manipulable objects."""
         ...
+
+    def get_push_task(self) -> dict:
+        """Return scene geometry for push-capable envs (optional)."""
+        raise NotImplementedError
+```
+
+Push-capable envs implement `get_push_task()` to expose scene info without computing trajectories:
+
+```python
+def get_push_task(self):
+    return {
+        "push_direction_xy": self.push_direction_xy,
+        "row_origin_xy": self.row_origin_xy,
+        "num_objects": self.num_cylinders,
+        "row_spacing": self.row.spacing,
+        "table_top_z": self._get_table_top_z(),
+    }
 ```
 
 ### Registered Environments
 
-| Env ID | Class | get_objects() | Notes |
-|--------|-------|---------------|-------|
-| `StackCube-v1` | Built-in ManiSkill | `{"cube_0": cubeB, "cube_1": cubeA}` | 2-cube stacking (fallback in `get_objects()` dispatch) |
-| `StackNCube-v1` | `StackNCubeEnv` | `{"cube_0": ..., "cube_N": ...}` | Parameterized N-cube (2-6), cube_0 is always green (base), any tower order valid. `env.num_cubes=N` |
-| `StackCubeDistractor-v1` | `StackCubeDistractorEnv` | `{"cube_0": green, "cube_1": red, "cube_2": blue}` | 2-cube stacking + blue distractor |
-| `ShelfEnv-v1` | `ShelfEnv` | `{"cyl_0": ..., "cyl_19": ...}` | Enclosed shelf, 19 blue + 1 red cylinder |
-| `BinWithObjects-v1` | `BinWithObjectsEnv` | `{obj.name: obj, ...}` | Bin with ~30 random primitives + YCB objects |
-| `OpenTableBottleClutter-v1` | `OpenTableBottleClutterEnv` | `{"bottle_0": ..., "bottle_N": ...}` | Open table with dense random bottle placements for push-data collection |
+| Env ID | Class | Notes |
+|--------|-------|-------|
+| `StackCube-v1` | Built-in ManiSkill | 2-cube stacking |
+| `StackNCube-v1` | `StackNCubeEnv` | Parameterized N-cube (2-6) |
+| `StackCubeDistractor-v1` | `StackCubeDistractorEnv` | 2-cube + blue distractor |
+| `ShelfEnv-v1` | `ShelfEnv` | Enclosed shelf, 19 blue + 1 red cylinder |
+| `BinWithObjects-v1` | `BinWithObjectsEnv` | Bin with ~30 random primitives + YCB objects |
+| `OpenTablePush-v1` | `OpenTablePushEnv` | Row of bottles on open table for push tests |
+| `OpenTableBottleClutter-v1` | `OpenTableBottleClutterEnv` | Dense random bottle placements |
 
 ### Environment Factories
 
 ```python
 from taskbench.envs.factory import make_env, make_single_env
 
-# Vectorized env for RL (multiple parallel envs, GPU backend)
-env = make_env(cfg.env)
+# Vectorized env for RL / batched data collection (GPU backend)
+env = make_env(cfg)
 
 # Single raw env for motion planner (num_envs=1, CPU backend, no vector wrapper)
-env = make_single_env(cfg.env)
+env = make_single_env(cfg)
 ```
 
-Motion-planner solvers **must** use `make_single_env()` because mplib requires `num_envs=1`, `sim_backend="cpu"`, and direct access to `env.unwrapped`.
+The factory reads `cfg.task` for env constructor kwargs and `cfg.runtime` for framework params. Motion-planner solvers **must** use `make_single_env()`.
 
 ---
 
@@ -115,146 +176,97 @@ from taskbench.solver import BaseSolver, SolverResult, register_solver
 
 @register_solver("my_task")
 class MyTaskSolver(BaseSolver):
-    def solve(self, env, seed=None) -> SolverResult:
+    def solve(self, env, seed=None, cfg=None) -> SolverResult:
         ...
 ```
 
 The `@register_solver` decorator adds the class to `SOLVER_REGISTRY`. Solvers under `taskbench/solvers/` are auto-discovered via `pkgutil.walk_packages` on first call to `get_solver()` — no manual imports needed.
+
+Solvers own the episode lifecycle — resets, evaluation, recording. The runner trusts the solver's `SolverResult`.
 
 ### SolverResult
 
 ```python
 @dataclass
 class SolverResult:
-    success: bool                           # task success
-    reward: float = 0.0                     # cumulative reward
-    elapsed_steps: int = 0                  # steps taken
-    info: dict = field(default_factory=dict) # task-specific data
-    failure_reason: Optional[str] = None    # human-readable reason
+    success: bool
+    reward: float = 0.0
+    elapsed_steps: int = 0
+    info: dict = field(default_factory=dict)
+    failure_reason: Optional[str] = None
 ```
+
+---
+
+## Skills
+
+See [docs/skills.md](skills.md) for full documentation of all skills, parameters, and return types.
+
+### SkillContext
+
+```python
+ctx = SkillContext(env)
+ctx.reset(seed=42)                        # env.reset + planner setup
+ctx.step_callback = recorder.record       # propagates to all skills
+ctx.pick("cube_1", lift_height=0.15)      # → PickResult
+ctx.place(target_pose)                    # → PlaceResult
+ctx.push(approach_pose, push_pose, ...)   # → PushResult
+```
+
+`ctx.initialize()` sets up planner/objects from current env state without resetting — for search-based solvers that manage their own resets.
 
 ---
 
 ## Adding a New Task
 
-A "task" consists of up to three pieces: an environment, a solver, and a Hydra config. **No edits to core files required.**
+A "task" consists of up to three pieces: an environment, a solver, and Hydra configs. **No edits to core files required.**
 
 ### 1. Create the Environment
 
-Create `taskbench/envs/my_task.py`:
-
-```python
-import torch
-import sapien
-from mani_skill.utils.registration import register_env
-from taskbench.envs.base import TaskEnv
-
-@register_env("MyTask-v1", max_episode_steps=200)
-class MyTaskEnv(TaskEnv):
-    SUPPORTED_ROBOTS = ["panda"]
-
-    def __init__(self, *args, robot_uids="panda", **kwargs):
-        super().__init__(*args, robot_uids=robot_uids, **kwargs)
-
-    def get_objects(self) -> dict[str, object]:
-        return {"target": self.target_obj}
-
-    def _load_scene(self, options: dict):
-        # Build scene actors
-        ...
-
-    def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
-        # Randomize object poses each episode
-        ...
-
-    def evaluate(self):
-        # Return {"success": torch.tensor([bool], device=self.device)}
-        ...
-
-    def _get_obs_extra(self, info: dict):
-        return dict(tcp_pose=self.agent.tcp.pose.raw_pose)
-
-    def compute_dense_reward(self, obs, action, info):
-        return torch.zeros(self.num_envs, device=self.device)
-
-    def compute_normalized_dense_reward(self, obs, action, info):
-        return torch.zeros(self.num_envs, device=self.device)
-```
-
-Register the env by adding an import to `taskbench/envs/__init__.py`:
-
-```python
-import taskbench.envs.my_task  # noqa: F401
-```
+Create `taskbench/envs/my_task.py` and register the import in `taskbench/envs/__init__.py`.
 
 ### 2. Create the Solver
 
-Create `taskbench/solvers/my_task.py`:
+Create `taskbench/solvers/my_solver.py` with `@register_solver("my_solver")`.
 
-```python
-from taskbench.skills.context import SkillContext
-from taskbench.solver import BaseSolver, SolverResult, register_solver
+### 3. Create the Hydra Configs
 
-@register_solver("my_task")
-class MyTaskSolver(BaseSolver):
-    def solve(self, env, seed=None) -> SolverResult:
-        ctx = SkillContext(env)
-        ctx.reset(seed=seed)
+`configs/task/my_task.yaml`:
 
-        pick_result = ctx.pick("target")
-        if not pick_result.success:
-            return SolverResult(success=False, failure_reason=pick_result.failure_reason)
+```yaml
+# @package _global_
+task:
+  env_id: MyTask-v1
+  my_param: 42
 
-        place_result = ctx.place(goal_pose)
-        if not place_result.success:
-            return SolverResult(success=False, failure_reason=place_result.failure_reason)
-
-        info = env.unwrapped.evaluate()
-        return SolverResult(success=bool(info["success"].item()))
+runtime:
+  max_episode_steps: 200
+  reward_mode: none
 ```
 
-### 3. Create the Hydra Config
-
-`configs/solver/my_task.yaml`:
+`configs/solver/my_solver.yaml`:
 
 ```yaml
 # @package _global_
 run:
-  solver: my_task
+  solver: my_solver
 
-env:
-  env_id: MyTask-v1
+runtime:
   control_mode: pd_joint_pos
   num_envs: 1
-  reward_mode: none
 ```
 
 ### 4. Run
 
 ```bash
-uv run python -m taskbench.run solver=my_task
+uv run python -m taskbench.run task=my_task solver=my_solver
 ```
-
-The solver is auto-discovered from `taskbench/solvers/my_task.py` (no registry edits). The config is found by Hydra in `configs/solver/` (no searchpath edits).
 
 ---
 
 ## State Recording
 
 See [docs/demos.md](demos.md) for full documentation on recording, HDF5 format, parsing, and replay.
-
----
-
-## Configuration
-
-All config is YAML-only (no Python dataclasses). `configs/default.yaml` defines the schema; solver configs in `configs/solver/` override env-specific fields.
-
-Override any field from the command line:
-
-```bash
-uv run python -m taskbench.run seed=123 env.record_video=true run.num_episodes=10
-uv run python -m taskbench.run solver=stack_cubes env.num_cubes=5
-```
 
 ---
 
