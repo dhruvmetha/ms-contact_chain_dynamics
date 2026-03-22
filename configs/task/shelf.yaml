@@ -10,7 +10,7 @@ task:
 
   # Robot
   robot_uids: ur5e_robotiq
-  robot_base_pose: [-0.56, 0.0, 0.0, 0, 0, 0, 1]  # [x, y, z, qw, qx, qy, qz]
+  robot_base_pose: [0.0, 0.0, 0.0, 0, 0, 0, 1]  # [x, y, z, qw, qx, qy, qz]
 
   # Objects — 1 red target + (num_objects - 1) blue distractors
   num_objects: 20
@@ -31,7 +31,7 @@ task:
   #       (open face)
   #
   shelf:
-    front_x: 0.42       # front edge X position (open face, closest to robot)
+    front_x: 0.6       # front edge X position (open face, closest to robot)
     depth: 0.30          # how deep the shelf extends away from robot (+X)
     half_w: 0.50         # half-width (full shelf = 1.0 m wide)
     floor_z: 0.55        # bottom board height above ground
