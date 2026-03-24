@@ -336,6 +336,11 @@ class UR5eRobotiq(BaseAgent):
         urdf_str = re.sub(r'joint name=""', _unique_fix, urdf_str)
         # Fix robot name too
         urdf_str = urdf_str.replace('robot name=""', 'robot name="ur5e_robotiq"')
+
+        # --- Inject collision geometry from SAPIEN shapes ---
+        # TODO: fix reference frame mismatch — disabled until debugged
+        # urdf_str = self._inject_collision_geometry(urdf_str)
+
         tmp = tempfile.NamedTemporaryFile(
             suffix=".urdf", prefix="ur5e_robotiq_", delete=False, mode="w"
         )
@@ -368,14 +373,12 @@ class UR5eRobotiq(BaseAgent):
             for gl in gripper_srdf_links:
                 srdf_str += f'  <disable_collisions link1="{wl}" link2="{gl}" reason="Never"/>\n'
         srdf_str += '</robot>\n'
-        srdf_tmp = tempfile.NamedTemporaryFile(
-            suffix=".srdf", prefix="ur5e_robotiq_", delete=False, mode="w"
-        )
-        srdf_tmp.write(srdf_str)
-        srdf_tmp.flush()
-        self._srdf_tmp = srdf_tmp
+        srdf_path = self.urdf_path.replace(".urdf", ".srdf")
+        with open(srdf_path, "w") as f:
+            f.write(srdf_str)
+        self._srdf_path = srdf_path
 
-        def _cleanup_temp_files(urdf=tmp.name, srdf=srdf_tmp.name):
+        def _cleanup_temp_files(urdf=tmp.name, srdf=srdf_path):
             for path in (urdf, srdf):
                 try:
                     os.unlink(path)
@@ -406,6 +409,66 @@ class UR5eRobotiq(BaseAgent):
         for link_name in gripper_links:
             link = self.robot.links_map[link_name]
             link.set_collision_group_bit(group=2, bit_idx=31, bit=1)
+
+    def _inject_collision_geometry(self, urdf_str: str) -> str:
+        """Add collision shapes from SAPIEN into the exported URDF.
+
+        The auto-exported URDF has no collision geometry, so mplib treats
+        the robot as a point.  This reads the actual PhysX collision shapes
+        from each link and injects them as URDF <collision> elements.
+
+        Uses string insertion (not XML re-serialization) to avoid breaking
+        the URDF structure that mplib's parser depends on.
+
+        Capsules are approximated as cylinders (URDF doesn't support capsules).
+        """
+        from transforms3d.euler import quat2euler
+
+        for link in self.robot.get_links():
+            name = link.get_name()
+            collision_xml = ""
+            for comp in link._objs[0].entity.components:
+                if not hasattr(comp, "get_collision_shapes"):
+                    continue
+                for shape in comp.get_collision_shapes():
+                    stype = type(shape).__name__
+                    pose = shape.get_local_pose()
+                    p = pose.p
+                    rpy = quat2euler([pose.q[0], pose.q[1], pose.q[2], pose.q[3]])
+
+                    if "Capsule" in stype or "Cylinder" in stype:
+                        hl = shape.half_length if hasattr(shape, "half_length") else 0.01
+                        geom_xml = f'<cylinder radius="{shape.radius}" length="{hl * 2}"/>'
+                    elif "Box" in stype:
+                        hs = shape.half_size
+                        geom_xml = f'<box size="{hs[0]*2} {hs[1]*2} {hs[2]*2}"/>'
+                    elif "Sphere" in stype:
+                        geom_xml = f'<sphere radius="{shape.radius}"/>'
+                    else:
+                        continue
+
+                    collision_xml += (
+                        f'<collision>'
+                        f'<origin xyz="{p[0]} {p[1]} {p[2]}" '
+                        f'rpy="{rpy[0]} {rpy[1]} {rpy[2]}"/>'
+                        f'<geometry>{geom_xml}</geometry>'
+                        f'</collision>'
+                    )
+
+            if collision_xml:
+                # Insert just before the closing </link> tag for this link
+                tag = f'<link name="{name}">'
+                # Find the link and its closing tag, insert before </link>
+                idx = urdf_str.find(tag)
+                if idx == -1:
+                    continue
+                # Find the closing </link> after this opening tag
+                close_idx = urdf_str.find("</link>", idx)
+                if close_idx == -1:
+                    continue
+                urdf_str = urdf_str[:close_idx] + collision_xml + urdf_str[close_idx:]
+
+        return urdf_str
 
     def _after_init(self):
         self.finger1_link = sapien_utils.get_obj_by_name(

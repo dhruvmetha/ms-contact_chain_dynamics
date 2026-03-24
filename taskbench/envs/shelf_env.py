@@ -90,10 +90,11 @@ class ShelfEnv(TaskEnv):
     SUPPORTED_REWARD_MODES = ["none"]
 
     def __init__(self, *args, robot_uids="panda", num_objects: int = 20,
-                 shelf=None, cylinder=None, **kwargs):
+                 shelf=None, cylinder=None, open_top: bool = False, **kwargs):
         self.shelf_geom = ShelfGeometry(**(shelf or {}))
         self.cyl_spec = CylinderSpec(**(cylinder or {}))
         self.num_objects = num_objects
+        self.open_top = open_top
         self.target_idx = 0
         super().__init__(
             *args,
@@ -123,9 +124,26 @@ class ShelfEnv(TaskEnv):
 
     @property
     def _default_human_render_camera_configs(self):
-        # Front-right view: see both the robot and the open face of the shelf
-        pose = sapien_utils.look_at([-0.15, -0.70, 0.65], [0.40, 0.0, 0.38])
-        return CameraConfig("render_camera", pose, 1024, 1024, 1, 0.01, 100)
+        g = self.shelf_geom
+        mid_z = g.surface_z + g.inner_h / 2
+
+        # Wide view from behind-right
+        wide = sapien_utils.look_at([-0.50, -1.00, 0.90], [0.50, 0.0, 0.50])
+        # Top-down: directly above, looking straight down (+Z to -Z)
+        top_down = sapien_utils.look_at(
+            [g.center_x, 0.001, g.ceil_z + 1.0],  # tiny y offset to avoid gimbal lock
+            [g.center_x, 0, g.surface_z],
+        )
+        # Side: directly from the side, looking along +Y axis
+        side = sapien_utils.look_at(
+            [g.center_x, -1.2, mid_z],
+            [g.center_x, 0, mid_z],
+        )
+        return [
+            CameraConfig("render_wide", wide, 512, 512, 1, 0.01, 100),
+            CameraConfig("render_topdown", top_down, 512, 512, 1, 0.01, 100),
+            CameraConfig("render_side", side, 512, 512, 1, 0.01, 100),
+        ]
 
     # ------------------------------------------------------------------
     # Collision geometry (for motion planner)
@@ -189,8 +207,9 @@ class ShelfEnv(TaskEnv):
 
         # Bottom board
         _box("shelf_bottom", [cx, 0, fz], [d / 2, hw, t])
-        # Top board (ceiling)
-        _box("shelf_top", [cx, 0, fz + 2 * t + ih], [d / 2, hw, t])
+        # Top board (ceiling) — skip if open_top for visualization
+        if not self.open_top:
+            _box("shelf_top", [cx, 0, fz + 2 * t + ih], [d / 2, hw, t])
         # Back wall (+X side, far from robot)
         _box("shelf_back", [g.back_x, 0, fz + t + ih / 2], [t, hw, ih / 2])
         # Left wall (-Y)

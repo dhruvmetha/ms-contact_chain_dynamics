@@ -41,7 +41,7 @@ def make_env(cfg):
     if rt.record_video and rt.render_mode != "human":
         env = RecordEpisode(
             env,
-            output_dir="videos",
+            output_dir=rt.get("video_dir", "videos"),
             save_trajectory=False,
             save_video=True,
             max_steps_per_video=rt.max_episode_steps,
@@ -78,7 +78,7 @@ def make_single_env(cfg):
     if rt.record_video and rt.render_mode != "human":
         env = RecordEpisode(
             env,
-            output_dir="videos",
+            output_dir=rt.get("video_dir", "videos"),
             save_trajectory=False,
             save_video=True,
             save_on_reset=False,

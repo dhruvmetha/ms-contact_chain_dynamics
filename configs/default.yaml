@@ -12,6 +12,7 @@ runtime:
   num_envs: 16
   max_episode_steps: 100
   record_video: false
+  video_dir: videos
   render_mode: rgb_array
 
 logging:

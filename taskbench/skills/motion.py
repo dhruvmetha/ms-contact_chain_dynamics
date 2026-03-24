@@ -937,11 +937,8 @@ def move_to_pose(env, planner, pose, gripper_state, robot_config: RobotConfig,
         raise ValueError("time_step_scale must be > 0")
     goal = sapien_to_mplib_pose(pose)
     current_qpos = env.unwrapped.agent.robot.get_qpos().cpu().numpy()[0]
-    result = planner.plan_screw(
-        goal,
-        current_qpos,
-        time_step=env.unwrapped.control_timestep * time_step_scale,
-    )
+    ts = env.unwrapped.control_timestep * time_step_scale
+    result = planner.plan_screw(goal, current_qpos, time_step=ts)
     if result["status"] != "Success":
         logger.warning("plan_screw failed: %s", result["status"])
         return None
@@ -953,5 +950,38 @@ def move_to_pose(env, planner, pose, gripper_state, robot_config: RobotConfig,
                        diagnostics=diagnostics,
                        allowed_contact_links=allowed_contact_links,
                        control_hook=control_hook,
+                       step_callback=step_callback,
+                       contact_force_threshold=contact_force_threshold)
+
+
+def move_to_pose_rrt(env, planner, pose, gripper_state, robot_config: RobotConfig,
+                     dry_run=False, monitor_contacts=False, diagnostics=None,
+                     allowed_contact_links=None, step_callback=None,
+                     time_step_scale=1.0, planning_time=2.0,
+                     contact_force_threshold=0.01):
+    """Plan and execute a collision-free motion to target pose using RRT.
+
+    Uses ``plan_pose()`` (RRT-based joint-space planning) which can find
+    paths around obstacles, unlike ``move_to_pose`` which only tries a
+    straight line.
+    """
+    time_step_scale = float(time_step_scale)
+    if time_step_scale <= 0:
+        raise ValueError("time_step_scale must be > 0")
+    goal = sapien_to_mplib_pose(pose)
+    current_qpos = env.unwrapped.agent.robot.get_qpos().cpu().numpy()[0]
+    ts = env.unwrapped.control_timestep * time_step_scale
+    result = planner.plan_pose(
+        goal, current_qpos, time_step=ts, planning_time=planning_time,
+    )
+    if result["status"] != "Success":
+        logger.warning("RRT planning failed: %s", result["status"])
+        return None
+    if dry_run:
+        return result
+    return follow_path(env, result, gripper_state, robot_config,
+                       monitor_contacts=monitor_contacts,
+                       diagnostics=diagnostics,
+                       allowed_contact_links=allowed_contact_links,
                        step_callback=step_callback,
                        contact_force_threshold=contact_force_threshold)
