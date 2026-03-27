@@ -35,12 +35,12 @@ CYL_UPRIGHT_Q = [0.7071068, 0, 0.7071068, 0]  # rotate +X axis -> +Z
 @dataclass
 class ShelfGeometry:
     """Shelf enclosure dimensions (meters)."""
-    front_x: float = 0.42       # front edge X (closest to robot)
+    front_x: float = 0.20       # front edge X (closest to robot)
     depth: float = 0.30         # depth along +X
-    half_w: float = 0.50        # half-width along Y
-    floor_z: float = 0.55       # bottom board height above ground
+    half_w: float = 0.25        # half-width along Y
+    floor_z: float = 0.30       # bottom board height above ground
     thickness: float = 0.01     # board/wall thickness
-    inner_h: float = 0.50       # interior height
+    inner_h: float = 0.25       # interior height
 
     # Derived — computed in __post_init__
     back_x: float = field(init=False)
@@ -198,18 +198,19 @@ class ShelfEnv(TaskEnv):
         t = g.thickness
         d = g.depth
 
-        def _box(name, center, half_size):
+        def _box(name, center, half_size, visual=True):
             b = self.scene.create_actor_builder()
             b.add_box_collision(half_size=half_size)
-            b.add_box_visual(half_size=half_size, material=mat)
+            if visual:
+                b.add_box_visual(half_size=half_size, material=mat)
             b.initial_pose = sapien.Pose(p=center)
             parts.append(b.build_static(name=name))
 
         # Bottom board
         _box("shelf_bottom", [cx, 0, fz], [d / 2, hw, t])
-        # Top board (ceiling) — skip if open_top for visualization
+        # Top board — collision only (no visual so cameras can see inside)
         if not self.open_top:
-            _box("shelf_top", [cx, 0, fz + 2 * t + ih], [d / 2, hw, t])
+            _box("shelf_top", [cx, 0, fz + 2 * t + ih], [d / 2, hw, t], visual=False)
         # Back wall (+X side, far from robot)
         _box("shelf_back", [g.back_x, 0, fz + t + ih / 2], [t, hw, ih / 2])
         # Left wall (-Y)

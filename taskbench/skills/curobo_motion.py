@@ -33,7 +33,7 @@ logger = logging.getLogger("taskbench.skills.curobo_motion")
 _CUROBO_ROBOT_CONFIGS = {
     "panda": "franka.yml",
     "panda_wristcam": "franka.yml",
-    "ur5e_robotiq": "configs/curobo/ur5e_robotiq_2f_85.yml",
+    "ur5e_robotiq": "configs/curobo/ur5e_robotiq_2f_140.yml",
 }
 
 # End-effector link to use in cuRobo for each robot.
@@ -43,7 +43,7 @@ _CUROBO_ROBOT_CONFIGS = {
 _CUROBO_EE_LINKS = {
     "panda": "ee_link",           # fingertip frame in cuRobo's franka URDF
     "panda_wristcam": "ee_link",
-    "ur5e_robotiq": "grasp_frame",  # fingertip frame in cuRobo's ur5e_robotiq URDF
+    "ur5e_robotiq": "grasp_frame",  # fingertip TCP in ur5e_robotiq_2f_140 URDF
 }
 
 # Arm joint names per robot (must match ManiSkill active joint order).
@@ -77,6 +77,31 @@ def get_tool_down_quat(robot_uid: str) -> list[float]:
     if robot_uid not in _TOOL_DOWN_QUATS:
         raise KeyError(f"No tool-down quaternion for robot {robot_uid!r}")
     return _TOOL_DOWN_QUATS[robot_uid]
+
+
+# Rotation matrix from world frame to cuRobo base_link frame per robot.
+# The ros-industrial UR5e URDF has a 180° Z rotation between base_link
+# and base_link_inertia. cuRobo plans in base_link frame, ManiSkill uses
+# the world frame aligned with base_link_inertia. So we need Rz(pi).
+_RZ_180 = torch.tensor([
+    [-1.0, 0.0, 0.0],
+    [0.0, -1.0, 0.0],
+    [0.0,  0.0, 1.0],
+])
+
+_CUROBO_BASE_ROTATIONS = {
+    "panda": None,              # no rotation needed
+    "panda_wristcam": None,
+    "ur5e_robotiq": _RZ_180,    # 180° Z between base_link and world
+}
+
+
+def get_curobo_base_rotation(robot_uid: str) -> Optional[torch.Tensor]:
+    """Return the world-to-cuRobo-base rotation matrix for a robot.
+
+    Returns None if no rotation is needed (base_link aligned with world).
+    """
+    return _CUROBO_BASE_ROTATIONS.get(robot_uid)
 
 
 def get_curobo_config_name(robot_uid: str) -> str:
@@ -163,6 +188,8 @@ def setup_curobo_planner(
         n_collision_envs=n_envs,
         use_cuda_graph=False,
         ee_link_name=ee_link,
+        rotation_threshold=0.01,  # tight orientation matching
+        num_ik_seeds=64,          # more IK attempts for harder orientations
     )
     motion_gen = MotionGen(mg_config)
 
@@ -221,8 +248,14 @@ def _sapien_qpos_to_cu_joint_state(
     qpos = raw.agent.robot.get_qpos()
     arm_qpos = qpos[:, :n_arm].detach().clone()  # (n_envs, n_arm)
 
-    return CuJointState.from_position(
-        arm_qpos.to(dtype=torch.float32),
+    cuda = torch.device("cuda:0") if torch.cuda.is_available() else arm_qpos.device
+    pos = arm_qpos.to(dtype=torch.float32, device=cuda)
+    vel = torch.zeros_like(pos)
+    acc = torch.zeros_like(pos)
+    return CuJointState(
+        position=pos,
+        velocity=vel,
+        acceleration=acc,
         joint_names=joint_names,
     )
 
@@ -264,6 +297,35 @@ def _build_actions(
     return actions
 
 
+def _world_to_curobo_frame(
+    positions: torch.Tensor,
+    robot_base_position: Optional[torch.Tensor] = None,
+    robot_base_rotation: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Transform world-frame positions to cuRobo's base_link frame.
+
+    Applies translation (subtract base position) then rotation (apply
+    inverse of base orientation). For the ros-industrial UR5e URDF,
+    base_link has a 180° Z rotation relative to the world frame, so
+    robot_base_rotation should be a (3, 3) rotation matrix representing
+    this relationship.
+
+    Args:
+        positions: (N, 3) world-frame positions.
+        robot_base_position: (3,) world position of robot base.
+        robot_base_rotation: (3, 3) rotation matrix from world to
+            cuRobo base_link frame. If None, identity is assumed.
+    """
+    if robot_base_position is not None:
+        base = robot_base_position.detach().reshape(-1)[:3]
+        positions = positions - base.unsqueeze(0)
+    if robot_base_rotation is not None:
+        # R @ p^T → (3, N), transpose back → (N, 3)
+        R = robot_base_rotation.to(device=positions.device, dtype=positions.dtype)
+        positions = (R @ positions.T).T.contiguous()
+    return positions
+
+
 def batched_move_to_pose(
     motion_gen: MotionGen,
     start_state: CuJointState,
@@ -273,18 +335,22 @@ def batched_move_to_pose(
     plan_config: Optional[MotionGenPlanConfig] = None,
     use_batch_env: bool = True,
     robot_base_position: Optional[torch.Tensor] = None,
+    robot_base_rotation: Optional[torch.Tensor] = None,
 ) -> dict:
     """Plan motions for N environments in batch.
 
     Args:
         motion_gen: Configured MotionGen instance.
         start_state: Current joint state for all envs (batched CuJointState).
-        goal_positions: (N, 3) goal TCP positions.
+        goal_positions: (N, 3) goal TCP positions in world frame.
         goal_quaternions: (N, 4) goal TCP quaternions (wxyz).
         n_envs: Number of environments.
         plan_config: Optional planning config overrides.
         use_batch_env: If True, use plan_batch_env (different world per env).
             If False, use plan_batch (same world for all).
+        robot_base_position: (3,) world position of robot base.
+        robot_base_rotation: (3, 3) rotation matrix from world to
+            cuRobo base_link frame.
 
     Returns:
         Dict with keys:
@@ -298,16 +364,16 @@ def batched_move_to_pose(
         from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
         plan_config = MotionGenPlanConfig(max_attempts=4, enable_graph=False)
 
-    # Transform goals from world frame to robot base frame if base is given.
-    # cuRobo plans in the robot's base frame (origin), but ManiSkill goals
-    # are in the world frame where the robot base is offset.
-    if robot_base_position is not None:
-        goal_positions = goal_positions - robot_base_position.unsqueeze(0)
+    goal_positions = _world_to_curobo_frame(
+        goal_positions, robot_base_position, robot_base_rotation)
 
     goal_pose = _sapien_poses_to_cu_poses(goal_positions, goal_quaternions)
 
     if use_batch_env and n_envs > 1:
         result = motion_gen.plan_batch_env(start_state, goal_pose, plan_config)
+    elif n_envs == 1:
+        # Use plan_single for single env — plan_batch has indexing bugs with batch=1
+        result = motion_gen.plan_single(start_state, goal_pose, plan_config)
     else:
         result = motion_gen.plan_batch(start_state, goal_pose, plan_config)
 
@@ -406,6 +472,7 @@ def batched_ik(
     n_envs: int,
     robot_uid: str = "panda",
     robot_base_position: Optional[torch.Tensor] = None,
+    robot_base_rotation: Optional[torch.Tensor] = None,
     seed_joints: Optional[torch.Tensor] = None,
 ) -> dict:
     """Solve IK for N goal poses in parallel using cuRobo.
@@ -415,6 +482,9 @@ def batched_ik(
 
     Args:
         robot_uid: Robot identifier for looking up arm joint names.
+        robot_base_position: (3,) world position of robot base.
+        robot_base_rotation: (3, 3) rotation matrix from world to
+            cuRobo base_link frame.
         seed_joints: (N, n_arm) optional joint seed. When provided, the
             IK solver is seeded with these joints so the solution stays
             close to the current configuration (important for straight-line
@@ -423,33 +493,27 @@ def batched_ik(
     Returns:
         Dict with "success" (N,) bool and "joint_positions" (N, n_arm) tensor.
     """
-    if robot_base_position is not None:
-        goal_positions = goal_positions - robot_base_position.unsqueeze(0)
+    goal_positions = _world_to_curobo_frame(
+        goal_positions, robot_base_position, robot_base_rotation)
 
     goal_pose = _sapien_poses_to_cu_poses(goal_positions, goal_quaternions)
 
     # Seed the IK with current joints so the solution is nearby.
     # ``retract_config`` sets the fallback configuration on failure AND
     # biases the solver toward this configuration during the search.
-    if seed_joints is not None:
-        from curobo.types.robot import JointState as CuJointState
+    result = motion_gen.ik_solver.solve_batch(goal_pose)
 
-        joint_names = get_arm_joint_names(robot_uid)
-        seed = seed_joints.to(dtype=torch.float32, device=goal_positions.device)
-        seed_state = CuJointState.from_position(seed, joint_names=joint_names)
-        result = motion_gen.ik_solver.solve_batch(
-            goal_pose, retract_config=seed_state, seed_config=seed_state,
-        )
-    else:
-        result = motion_gen.ik_solver.solve_batch(goal_pose)
-
-    success = result.success  # (N,) bool on GPU
+    success = result.success.squeeze()  # ensure (N,) bool
+    if success.dim() == 0:
+        success = success.unsqueeze(0)
 
     # Build full (N, n_arm) tensor, filling failures with seed/zeros
     n_arm = result.solution.shape[-1]
     fallback = seed_joints if seed_joints is not None else torch.zeros(n_envs, n_arm)
-    joint_positions = fallback.clone().to(device=result.solution.device)
-    joint_positions[success] = result.solution[success, 0]
+    joint_positions = fallback.clone().to(device=result.solution.device, dtype=torch.float32)
+    for i in range(n_envs):
+        if success[i]:
+            joint_positions[i] = result.solution[i, 0]
 
     return {
         "success": success.cpu(),

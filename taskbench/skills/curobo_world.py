@@ -23,6 +23,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger("taskbench.skills.curobo_world")
 
 
+def _world_to_base_frame(center: np.ndarray, robot_base: np.ndarray,
+                          robot_uid: str = "") -> np.ndarray:
+    """Transform a world-frame position to cuRobo's base_link frame.
+
+    Subtracts the robot base position, then applies the rotation needed
+    for the specific robot URDF (e.g. 180° Z for ros-industrial UR5e).
+    """
+    center = center - robot_base
+    # ros-industrial UR5e has 180° Z rotation between base_link and world
+    if "ur5e" in robot_uid:
+        center = np.array([-center[0], -center[1], center[2]])
+    return center
+
+
 def _actor_box_params(actor):
     """Extract center and half-size from a box-shaped SAPIEN actor.
 
@@ -142,30 +156,56 @@ def open_table_world(env, n_envs: int = 1) -> list:
     return [world_config] * n_envs
 
 
-def shelf_world(env, n_envs: int = 1) -> list:
-    """Build cuRobo WorldConfig for shelf environments.
+def shelf_world(env, n_envs: int = 1, include_objects: bool = False,
+                exclude_parts: set[str] | None = None) -> list:
+    """Build cuRobo WorldConfig for shelf environments in robot base frame.
 
-    Includes the table and shelf panels as cuboids. Objects on the shelf
-    are excluded (they are manipulation targets).
+    All obstacle positions are transformed from world frame to cuRobo's
+    base_link frame, accounting for both translation and rotation.
+
+    Args:
+        include_objects: If True, also include cylinders on the shelf as
+            cuboid obstacles (bounding boxes).
+        exclude_parts: Set of substrings to exclude from shelf parts
+            (e.g. {"back", "leg"} to skip the back wall and legs).
     """
     from curobo.geom.types import WorldConfig
 
     raw = env.unwrapped if hasattr(env, "unwrapped") else env
+
+    # Robot base position for world→base frame transform
+    robot_base = np.asarray(
+        raw.agent.robot.pose.p[0].cpu(), dtype=np.float64
+    ).flatten()[:3]
+
+    # Detect robot uid for frame rotation
+    robot_uid = getattr(raw.agent, "uid", "")
+
     cuboids = []
 
-    table = _extract_table_cuboid(env)
-    if table is not None:
-        cuboids.append(table)
-
     # Extract shelf panels
+    exclude = exclude_parts or set()
     for actor in raw.scene.get_all_actors():
         if "shelf" not in actor.name and "panel" not in actor.name and "leg" not in actor.name:
+            continue
+        # Skip excluded parts
+        if any(ex in actor.name for ex in exclude):
             continue
         params = _actor_box_params(actor)
         if params is None:
             continue
         center, half_size = params
+        center = _world_to_base_frame(center, robot_base, robot_uid)
         cuboids.append(_make_cuboid(actor.name, center, half_size))
+
+    # Optionally include cylinders as bounding-box cuboids
+    if include_objects and hasattr(raw, "shelf_objects"):
+        for i, obj in enumerate(raw.shelf_objects):
+            p = obj.pose.p.cpu().numpy().flatten()[:3]
+            p = _world_to_base_frame(p, robot_base, robot_uid)
+            r = raw.cyl_spec.radius
+            hl = raw.cyl_spec.half_length
+            cuboids.append(_make_cuboid(f"cyl_{i}", p, [r, r, hl]))
 
     world_config = WorldConfig(cuboid=cuboids)
     return [world_config] * n_envs
