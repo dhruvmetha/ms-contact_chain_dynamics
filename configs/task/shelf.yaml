@@ -10,7 +10,7 @@ task:
 
   # Robot — placed so shelf front is at x=0.20 in robot base frame
   robot_uids: ur5e_robotiq
-  robot_base_pose: [0.0, 0.0, 0.0, 0, 0, 0, 1]  # [x, y, z, qw, qx, qy, qz]
+  robot_base_pose: [0.0, 0.0, 0.0, 1, 0, 0, 0]  # [x, y, z, qw, qx, qy, qz] identity
 
   # Objects — 1 red target + (num_objects - 1) blue distractors
   num_objects: 20
@@ -36,12 +36,12 @@ task:
   #   - Shelf surface z=0.30 in best vertical coverage zone (z=0.20–0.55)
   #   - half_w=0.25 keeps lateral reach within ±0.25 (well within ±0.90 workspace)
   shelf:
-    front_x: 0.20        # front edge X (open face, 0.20m from robot base)
-    depth: 0.30           # shelf extends to x=0.50 (within 0.50m reach limit)
-    half_w: 0.25          # half-width (full shelf = 0.50m, within ±0.90m reach)
-    floor_z: 0.30         # bottom board height (z=0.30, mid workspace)
-    thickness: 0.01       # board / wall thickness
-    inner_h: 0.25         # interior height (top at z=0.57, within z=0.70 limit)
+    front_x: 0.45         # front edge X (closer to robot)
+    depth: 0.15            # shallow (reachable depth)
+    half_w: 0.15           # narrow (30cm total, fits reachable y=±0.10)
+    floor_z: 0.30          # bottom board height
+    thickness: 0.01        # board / wall thickness
+    inner_h: 0.35          # interior height (~35cm)
 
 
 runtime:

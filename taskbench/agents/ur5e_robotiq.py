@@ -36,12 +36,12 @@ _DATA_DIR = pathlib.Path(__file__).resolve().parent.parent.parent / "data"
 @register_agent()
 class UR5eRobotiq(BaseAgent):
     uid = "ur5e_robotiq"
-    urdf_path = str(_DATA_DIR / "robots/ur5e_robotiq_2f_140/ur5e_robotiq_2f_140.urdf")
+    urdf_path = str(_DATA_DIR / "robots/ur5e_robotiq_2f_85/ur5e_robotiq_2f_85.urdf")
     fix_root_link = True
 
     urdf_config = dict(
         _materials=dict(
-            gripper=dict(static_friction=2.0, dynamic_friction=2.0, restitution=0.0)
+            gripper=dict(static_friction=5.0, dynamic_friction=5.0, restitution=0.0)
         ),
         link=dict(
             left_inner_finger_pad=dict(
@@ -67,14 +67,14 @@ class UR5eRobotiq(BaseAgent):
             "right_inner_knuckle",
         }),
         gripper_open=0.0,
-        gripper_closed=0.7,
+        gripper_closed=0.81,
     )
     table_scene_base_pose = sapien.Pose([-0.56, 0, 0], [0, 0, 0, 1])
 
     keyframes = dict(
         rest=Keyframe(
             qpos=np.array([
-                3.14159, -2.2, 1.0, -1.383, -1.57, 0.0,  # arm: tucked, facing +X world
+                0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0,     # arm: upright
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,            # gripper: open
             ]),
             pose=sapien.Pose([0, 0, 0]),
@@ -207,14 +207,14 @@ class UR5eRobotiq(BaseAgent):
         # ------------------------------------------------------------------ #
         # Gripper controllers (Robotiq 2F-140, ros-industrial linkage)
         # ------------------------------------------------------------------ #
-        # Active mimic pair: finger_joint drives, right_outer_knuckle follows
+        # Active mimic pair: left_outer_knuckle drives, right_outer_knuckle follows
         finger_joint_names = [
-            "finger_joint",
+            "left_outer_knuckle_joint",
             "right_outer_knuckle_joint",
         ]
         mimic_config = dict(
             right_outer_knuckle_joint=dict(
-                joint="finger_joint", multiplier=-1.0, offset=0.0
+                joint="left_outer_knuckle_joint", multiplier=1.0, offset=0.0
             ),
         )
         finger_mimic_pd_joint_pos = PDJointPosMimicControllerConfig(
@@ -251,7 +251,7 @@ class UR5eRobotiq(BaseAgent):
         passive_finger_joints = PassiveControllerConfig(
             joint_names=passive_finger_joint_names,
             damping=0,
-            friction=0,
+            friction=5.0,
         )
 
         # ------------------------------------------------------------------ #
@@ -318,6 +318,44 @@ class UR5eRobotiq(BaseAgent):
         return deepcopy(controller_configs)
 
     def _after_loading_articulation(self):
+        # Create drive constraints for the Robotiq 4-bar linkage.
+        # Without these, the passive inner finger joints free-float.
+        # Drive poses from ManiSkill's FloatingRobotiq2F85Gripper agent.
+        p_f_right = [-1.6048949e-08, 3.7600022e-02, 4.3000020e-02]
+        p_p_right = [1.3578170e-09, -1.7901104e-02, 6.5159947e-03]
+        p_f_left = [-1.8080145e-08, 3.7600014e-02, 4.2999994e-02]
+        p_p_left = [-1.4041154e-08, -1.7901093e-02, 6.5159872e-03]
+
+        # Right finger drive
+        outer_finger = self.robot.active_joints_map["right_inner_finger_joint"]
+        inner_knuckle = self.robot.active_joints_map["right_inner_knuckle_joint"]
+        pad = outer_finger.get_child_link()
+        lif = inner_knuckle.get_child_link()
+        right_drive = self.scene.create_drive(
+            lif, sapien.Pose(p_f_right), pad, sapien.Pose(p_p_right)
+        )
+        right_drive.set_limit_x(0, 0)
+        right_drive.set_limit_y(0, 0)
+        right_drive.set_limit_z(0, 0)
+        right_drive.set_drive_property_x(stiffness=5e3, damping=200)
+        right_drive.set_drive_property_y(stiffness=5e3, damping=200)
+        right_drive.set_drive_property_z(stiffness=5e3, damping=200)
+
+        # Left finger drive
+        outer_finger = self.robot.active_joints_map["left_inner_finger_joint"]
+        inner_knuckle = self.robot.active_joints_map["left_inner_knuckle_joint"]
+        pad = outer_finger.get_child_link()
+        lif = inner_knuckle.get_child_link()
+        left_drive = self.scene.create_drive(
+            lif, sapien.Pose(p_f_left), pad, sapien.Pose(p_p_left)
+        )
+        left_drive.set_limit_x(0, 0)
+        left_drive.set_limit_y(0, 0)
+        left_drive.set_limit_z(0, 0)
+        left_drive.set_drive_property_x(stiffness=5e3, damping=200)
+        left_drive.set_drive_property_y(stiffness=5e3, damping=200)
+        left_drive.set_drive_property_z(stiffness=5e3, damping=200)
+
         # Disable self-collisions between gripper links
         gripper_links = [
             "robotiq_arg2f_base_link",

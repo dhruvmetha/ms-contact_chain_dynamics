@@ -31,9 +31,6 @@ def _world_to_base_frame(center: np.ndarray, robot_base: np.ndarray,
     for the specific robot URDF (e.g. 180° Z for ros-industrial UR5e).
     """
     center = center - robot_base
-    # ros-industrial UR5e has 180° Z rotation between base_link and world
-    if "ur5e" in robot_uid:
-        center = np.array([-center[0], -center[1], center[2]])
     return center
 
 

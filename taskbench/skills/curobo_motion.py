@@ -33,7 +33,7 @@ logger = logging.getLogger("taskbench.skills.curobo_motion")
 _CUROBO_ROBOT_CONFIGS = {
     "panda": "franka.yml",
     "panda_wristcam": "franka.yml",
-    "ur5e_robotiq": "configs/curobo/ur5e_robotiq_2f_140.yml",
+    "ur5e_robotiq": "configs/curobo/ur5e_robotiq_2f_85.yml",
 }
 
 # End-effector link to use in cuRobo for each robot.
@@ -551,6 +551,127 @@ def batched_linear_push(
     for t in range(total_steps):
         alpha = min(float(t) / max(n_steps - 1, 1), 1.0)
         arm_targets = start + alpha * (end - start)
+        actions = _build_actions(
+            arm_targets, gripper_state, control_mode,
+            n_arm_joints, device, n_envs,
+        )
+        obs, rewards, terminations, truncations, infos = env.step(actions)
+        if step_callback is not None:
+            step_callback(t, obs, rewards)
+
+    return {"obs": obs, "rewards": rewards, "steps_executed": total_steps}
+
+
+def batched_cartesian_push(
+    env,
+    motion_gen,
+    start_pos: torch.Tensor,
+    end_pos: torch.Tensor,
+    orientation: torch.Tensor,
+    start_arm_joints: torch.Tensor,
+    gripper_state: float,
+    n_envs: int,
+    n_arm_joints: int = 6,
+    n_waypoints: int = 20,
+    steps_per_waypoint: int = 4,
+    refine_steps: int = 20,
+    robot_base_position: Optional[torch.Tensor] = None,
+    robot_base_rotation: Optional[torch.Tensor] = None,
+    step_callback=None,
+) -> dict:
+    """Execute a straight-line Cartesian push via IK at each waypoint.
+
+    Samples N waypoints along the Cartesian line from start_pos to end_pos,
+    solves IK at each (seeded with previous solution for continuity), then
+    executes the joint sequence.
+
+    Args:
+        motion_gen: cuRobo MotionGen (used for IK only).
+        start_pos: (N_envs, 3) push start positions in world frame.
+        end_pos: (N_envs, 3) push end positions in world frame.
+        orientation: (N_envs, 4) target orientation quaternion (wxyz).
+        start_arm_joints: (N_envs, n_arm) starting joint config.
+        n_waypoints: Number of Cartesian waypoints along the line.
+        steps_per_waypoint: Sim steps to hold each waypoint.
+    """
+    raw = env.unwrapped
+    device = raw.device
+    control_mode = raw.control_mode
+    cuda = start_pos.device
+
+    # Interpolate Cartesian waypoints: (n_waypoints, N_envs, 3)
+    alphas = torch.linspace(0, 1, n_waypoints, device=cuda).unsqueeze(1).unsqueeze(2)
+    waypoints = start_pos.unsqueeze(0) + alphas * (end_pos - start_pos).unsqueeze(0)
+    # waypoints shape: (n_waypoints, n_envs, 3)
+
+    # Solve IK at each waypoint, seeded with previous solution
+    joint_path = []  # list of (n_envs, n_arm) tensors
+    prev_joints = start_arm_joints.to(device=cuda, dtype=torch.float32)
+    n_ik_ok = 0
+
+    for wi in range(n_waypoints):
+        wp_pos = waypoints[wi]  # (n_envs, 3)
+        wp_pos_base = _world_to_curobo_frame(wp_pos, robot_base_position, robot_base_rotation)
+        wp_quat = orientation  # (n_envs, 4)
+        goal = _sapien_poses_to_cu_poses(wp_pos_base, wp_quat)
+
+        # Seed with previous solution for joint-space continuity
+        seed = prev_joints.unsqueeze(1)  # (n_envs, 1, n_arm)
+        result = motion_gen.ik_solver.solve_batch(goal, seed_config=seed)
+
+        success = result.success.squeeze().cpu()
+        joints = result.solution[:, 0].to(device=cuda, dtype=torch.float32)
+
+        if success.dim() == 0:
+            success = success.unsqueeze(0)
+
+        # For failed IKs, retry without seed (allows joint reconfiguration)
+        any_failed = not success.all()
+        if any_failed:
+            result2 = motion_gen.ik_solver.solve_batch(goal)
+            success2 = result2.success.squeeze().cpu()
+            if success2.dim() == 0:
+                success2 = success2.unsqueeze(0)
+            joints2 = result2.solution[:, 0].to(device=cuda, dtype=torch.float32)
+            for i in range(n_envs):
+                if not success[i] and success2[i]:
+                    joints[i] = joints2[i]
+                    success[i] = True
+
+        all_ok = True
+        for i in range(n_envs):
+            if not success[i]:
+                joints[i] = prev_joints[i]
+                all_ok = False
+        if all_ok:
+            n_ik_ok += 1
+
+        joint_path.append(joints.cpu())
+        prev_joints = joints
+
+    logger.info("Cartesian push: %d/%d waypoints IK solved", n_ik_ok, n_waypoints)
+
+    # Execute the joint path — smoothly interpolate between waypoints
+    n_exec_steps = n_waypoints * steps_per_waypoint
+    total_steps = n_exec_steps + refine_steps
+    obs = rewards = None
+
+    # Stack joint path for easy indexing: (n_waypoints, n_envs, n_arm)
+    joint_path_t = torch.stack(joint_path)  # (n_waypoints, n_envs, n_arm)
+
+    for t in range(total_steps):
+        if t < n_exec_steps:
+            # Smooth interpolation between waypoints
+            progress = t / max(n_exec_steps - 1, 1)  # 0→1
+            wp_float = progress * (n_waypoints - 1)
+            wp_lo = int(wp_float)
+            wp_hi = min(wp_lo + 1, n_waypoints - 1)
+            alpha = wp_float - wp_lo
+            arm_targets = (
+                (1 - alpha) * joint_path_t[wp_lo] + alpha * joint_path_t[wp_hi]
+            ).to(device=device, dtype=torch.float32)
+        else:
+            arm_targets = joint_path_t[-1].to(device=device, dtype=torch.float32)
         actions = _build_actions(
             arm_targets, gripper_state, control_mode,
             n_arm_joints, device, n_envs,

@@ -84,6 +84,7 @@ def make_single_env(cfg):
             save_on_reset=False,
             record_reward=False,
             video_fps=30,
+            render_substeps=False,
         )
 
     return env
