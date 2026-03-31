@@ -33,6 +33,8 @@ logger = logging.getLogger("taskbench.skills.curobo_motion")
 _CUROBO_ROBOT_CONFIGS = {
     "panda": "franka.yml",
     "panda_wristcam": "franka.yml",
+    "panda_stick": "configs/curobo/panda_stick.yml",
+    "panda_stick_long": "configs/curobo/panda_stick_long.yml",
     "ur5e_robotiq": "configs/curobo/ur5e_robotiq_2f_85.yml",
 }
 
@@ -43,6 +45,8 @@ _CUROBO_ROBOT_CONFIGS = {
 _CUROBO_EE_LINKS = {
     "panda": "ee_link",           # fingertip frame in cuRobo's franka URDF
     "panda_wristcam": "ee_link",
+    "panda_stick": "panda_hand_tcp",  # stick tip in ManiSkill's panda_stick URDF
+    "panda_stick_long": "panda_hand_tcp",
     "ur5e_robotiq": "grasp_frame",  # fingertip TCP in ur5e_robotiq_2f_140 URDF
 }
 
@@ -56,6 +60,8 @@ _PANDA_ARM_JOINTS = [
 _ARM_JOINT_NAMES = {
     "panda": _PANDA_ARM_JOINTS,
     "panda_wristcam": _PANDA_ARM_JOINTS,
+    "panda_stick": _PANDA_ARM_JOINTS,
+    "panda_stick_long": _PANDA_ARM_JOINTS,
     "ur5e_robotiq": [
         "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
         "wrist_1_joint", "wrist_2_joint", "wrist_3_joint",
@@ -68,6 +74,8 @@ _ARM_JOINT_NAMES = {
 _TOOL_DOWN_QUATS = {
     "panda": [0.7071068, 0.0, 0.7071068, 0.0],
     "panda_wristcam": [0.7071068, 0.0, 0.7071068, 0.0],
+    "panda_stick": [0.7071068, 0.0, 0.7071068, 0.0],
+    "panda_stick_long": [0.7071068, 0.0, 0.7071068, 0.0],
     "ur5e_robotiq": [0.0, 1.0, 0.0, 0.0],
 }
 
@@ -92,6 +100,8 @@ _RZ_180 = torch.tensor([
 _CUROBO_BASE_ROTATIONS = {
     "panda": None,              # no rotation needed
     "panda_wristcam": None,
+    "panda_stick": None,        # same as panda — base aligned with world
+    "panda_stick_long": None,
     "ur5e_robotiq": _RZ_180,    # 180° Z between base_link and world
 }
 
@@ -171,9 +181,15 @@ def setup_curobo_planner(
         # Config is at configs/curobo/foo.yml → parents[2] is project root
         project_root = config_path.parents[2]
         kin = robot_dict["robot_cfg"]["kinematics"]
+        # Resolve __MANISKILL_PANDA__ marker to ManiSkill's asset directory
+        import mani_skill
+        _ms_panda_dir = str(Path(mani_skill.__path__[0]) / "assets" / "robots" / "panda")
         for key in ("urdf_path", "asset_root_path"):
-            if key in kin and kin[key] and not Path(kin[key]).is_absolute():
-                kin[key] = str(project_root / kin[key])
+            if key in kin and kin[key]:
+                if "__MANISKILL_PANDA__" in kin[key]:
+                    kin[key] = kin[key].replace("__MANISKILL_PANDA__", _ms_panda_dir)
+                elif not Path(kin[key]).is_absolute():
+                    kin[key] = str(project_root / kin[key])
         curobo_config = robot_dict
 
     # MotionGenConfig accepts None, list[WorldConfig], WorldConfig, or dict
@@ -280,20 +296,25 @@ def _sapien_poses_to_cu_poses(
 
 def _build_actions(
     arm_targets: torch.Tensor,
-    gripper_state: float,
+    gripper_state: float | None,
     control_mode: str,
     n_arm_joints: int,
     device: torch.device,
     n_envs: int,
 ) -> torch.Tensor:
-    """Build (N, action_dim) action tensor from arm joint targets and gripper."""
+    """Build (N, action_dim) action tensor from arm joint targets and gripper.
+
+    Pass ``gripper_state=None`` for gripper-less robots (e.g. panda_stick).
+    """
+    has_gripper = gripper_state is not None
     if control_mode == "pd_joint_pos_vel":
-        action_dim = n_arm_joints * 2 + 1
+        action_dim = n_arm_joints * 2 + (1 if has_gripper else 0)
     else:
-        action_dim = n_arm_joints + 1
+        action_dim = n_arm_joints + (1 if has_gripper else 0)
     actions = torch.zeros(n_envs, action_dim, device=device, dtype=torch.float32)
     actions[:, :n_arm_joints] = arm_targets
-    actions[:, -1] = gripper_state
+    if has_gripper:
+        actions[:, -1] = gripper_state
     return actions
 
 

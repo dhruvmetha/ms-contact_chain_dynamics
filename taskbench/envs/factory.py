@@ -1,10 +1,32 @@
+import gc
+
 import gymnasium as gym
+import torch
 from omegaconf import OmegaConf
 
 from mani_skill.utils.wrappers import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
 import taskbench.envs  # noqa: F401 — register custom envs
+
+
+def cleanup_env(env):
+    """Close a ManiSkill env and free all GPU resources.
+
+    SAPIEN's PhysX GPU cache leaks memory across sequential env
+    creation/destruction cycles. This function explicitly clears
+    the cache after closing to prevent accumulation.
+    """
+    env.close()
+    try:
+        import sapien.physx as physx
+        physx.clear_cache()
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    gc.collect()
 
 
 def _task_kwargs(cfg):

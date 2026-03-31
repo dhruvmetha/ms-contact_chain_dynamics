@@ -1,0 +1,20 @@
+# @package _global_
+task:
+  env_id: ShelfEnv-v1
+  robot_uids: panda_stick_long
+  robot_base_pose: [-0.4, 0.15, 0.0, 1, 0, 0, 0]
+  num_objects: 10
+  cylinder:
+    radius: 0.018
+    half_length: 0.045
+  shelf:
+    front_x: 0.25
+    depth: 0.20
+    half_w: 0.25
+    floor_z: 0.40
+    thickness: 0.01
+    inner_h: 0.30            # arm links (not just EE) need clearance inside the shelf
+
+runtime:
+  reward_mode: none
+  record_video: true

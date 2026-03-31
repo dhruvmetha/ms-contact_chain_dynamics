@@ -127,22 +127,23 @@ class ShelfEnv(TaskEnv):
         g = self.shelf_geom
         mid_z = g.surface_z + g.inner_h / 2
 
-        # Wide view from behind-right
-        wide = sapien_utils.look_at([-0.50, -1.00, 0.90], [0.50, 0.0, 0.50])
-        # Top-down: directly above, looking straight down (+Z to -Z)
-        top_down = sapien_utils.look_at(
-            [g.center_x, 0.001, g.ceil_z + 1.0],  # tiny y offset to avoid gimbal lock
+        # Close front-right: looking into the shelf opening
+        front_close = sapien_utils.look_at(
+            [g.front_x - 0.25, -0.35, mid_z + 0.15],
+            [g.center_x, 0.0, mid_z],
+        )
+        # Close front-left: opposite angle
+        front_left = sapien_utils.look_at(
+            [g.front_x - 0.20, 0.35, mid_z + 0.10],
+            [g.center_x, 0.0, mid_z],
+        )
+        # Close top-down: tight on the shelf interior
+        top_close = sapien_utils.look_at(
+            [g.center_x, 0.001, g.ceil_z + 0.40],
             [g.center_x, 0, g.surface_z],
         )
-        # Side: directly from the side, looking along +Y axis
-        side = sapien_utils.look_at(
-            [g.center_x, -1.2, mid_z],
-            [g.center_x, 0, mid_z],
-        )
         return [
-            CameraConfig("render_wide", wide, 512, 512, 1, 0.01, 100),
-            CameraConfig("render_topdown", top_down, 512, 512, 1, 0.01, 100),
-            CameraConfig("render_side", side, 512, 512, 1, 0.01, 100),
+            CameraConfig("render_topdown", top_close, 512, 512, 0.9, 0.01, 100),
         ]
 
     # ------------------------------------------------------------------
@@ -260,19 +261,50 @@ class ShelfEnv(TaskEnv):
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         self._reset_robot(env_idx)
-        with torch.device(self.device):
-            g = self.shelf_geom
-            margin = self.cyl_spec.radius + 0.01
-            x_lo = g.front_x + margin
-            x_hi = g.back_x - margin
-            y_lo = -g.half_w + margin
-            y_hi = g.half_w - margin
-            z = g.surface_z + self.cyl_spec.half_length
+        if self.num_objects == 0:
+            return
 
-            for i, obj in enumerate(self.shelf_objects):
-                x = self.np_random.uniform(x_lo, x_hi)
-                y = self.np_random.uniform(y_lo, y_hi)
-                obj.set_pose(sapien.Pose(p=[x, y, z], q=CYL_UPRIGHT_Q))
+        from mani_skill.utils.structs.pose import Pose as MSPose
+
+        g = self.shelf_geom
+        margin = self.cyl_spec.radius + 0.01
+        x_lo = g.front_x + margin
+        x_hi = g.back_x - margin
+        y_lo = -g.half_w + margin
+        y_hi = g.half_w - margin
+        z = g.surface_z + self.cyl_spec.half_length
+        min_dist = self.cyl_spec.radius * 2.5  # no overlap
+        b = len(env_idx)
+
+        # Track placed positions for overlap rejection (b, i, 2)
+        placed = torch.zeros(b, 0, 2, device=self.device)
+
+        for i, obj in enumerate(self.shelf_objects):
+            # Rejection sample: generate candidates until no overlap
+            pos = torch.zeros(b, 3, device=self.device)
+            for _ in range(200):
+                # Random (x, y) per env
+                xy = torch.rand(b, 2, device=self.device)
+                xy[:, 0] = xy[:, 0] * (x_hi - x_lo) + x_lo
+                xy[:, 1] = xy[:, 1] * (y_hi - y_lo) + y_lo
+
+                if placed.shape[1] == 0:
+                    break  # first object, no overlap check needed
+
+                # Check min distance to all previously placed objects
+                # placed: (b, i, 2), xy: (b, 2) -> (b, 1, 2)
+                diffs = placed - xy.unsqueeze(1)  # (b, i, 2)
+                dists = torch.norm(diffs, dim=2)   # (b, i)
+                min_dists = dists.min(dim=1).values  # (b,)
+                if (min_dists > min_dist).all():
+                    break
+
+            pos[:, 0] = xy[:, 0]
+            pos[:, 1] = xy[:, 1]
+            pos[:, 2] = z
+            placed = torch.cat([placed, xy.unsqueeze(1)], dim=1)
+
+            obj.set_pose(MSPose.create_from_pq(p=pos, q=CYL_UPRIGHT_Q))
 
     # ------------------------------------------------------------------
     # Evaluation / obs / reward
@@ -295,8 +327,8 @@ class ShelfEnv(TaskEnv):
                 [obj.pose.p for obj in self.shelf_objects], dim=-1
             )
             obs["obj_poses"] = obj_poses
-            obs["target_idx"] = torch.tensor(
-                [[self.target_idx]], device=self.device, dtype=torch.float32
+            obs["target_idx"] = torch.full(
+                (self.num_envs, 1), self.target_idx, device=self.device, dtype=torch.float32
             )
             obs["target_pos"] = self.target_object.pose.p
         return obs
