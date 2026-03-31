@@ -729,3 +729,73 @@ def batched_actuate_gripper(
         env.step(actions)
         if step_callback is not None:
             step_callback(t, None, None)
+
+
+def batched_ee_delta_move(
+    env,
+    target_positions: torch.Tensor,
+    *,
+    max_steps: int = 100,
+    max_delta: float = 0.03,
+    convergence_threshold: float = 0.003,
+    step_callback=None,
+) -> dict:
+    """Drive N TCPs to target positions using pd_ee_delta_pose control.
+
+    Assumes the env is already in ``pd_ee_delta_pose`` control mode.
+    Position deltas are clipped per step; rotation deltas are zero
+    (maintains current orientation). Exits early when all envs converge.
+
+    Args:
+        env: ManiSkill env (single or GPU-vectorized).
+        target_positions: (N, 3) world-frame target positions.
+        max_steps: Maximum number of steps before giving up.
+        max_delta: Per-step position delta clipping bound.
+        convergence_threshold: Distance below which an env is converged.
+        step_callback: Optional ``(step, obs, rewards) -> None``.
+
+    Returns:
+        Dict with:
+            - "converged": (N,) bool tensor
+            - "final_dists": (N,) float tensor
+            - "steps_executed": int
+            - "obs": final observation
+            - "rewards": final reward
+    """
+    raw = env.unwrapped
+    device = raw.device
+    targets = target_positions.to(device)
+    n_envs = targets.shape[0]
+
+    obs = rewards = None
+    steps_executed = 0
+
+    for step in range(max_steps):
+        tcp = raw.agent.tcp.pose.p  # (N, 3)
+        dists = torch.norm(targets - tcp, dim=1)
+
+        if (dists < convergence_threshold).all():
+            break
+
+        delta = torch.clamp(targets - tcp, -max_delta, max_delta)
+        action = torch.zeros(n_envs, 6, device=device)
+        action[:, :3] = delta
+        # rotation deltas = 0 → maintain current orientation
+
+        obs, rewards, _, _, _ = env.step(action)
+        steps_executed = step + 1
+
+        if step_callback is not None:
+            step_callback(step, obs, rewards)
+
+    tcp_final = raw.agent.tcp.pose.p
+    final_dists = torch.norm(targets - tcp_final, dim=1)
+    converged = final_dists < convergence_threshold
+
+    return {
+        "converged": converged,
+        "final_dists": final_dists,
+        "steps_executed": steps_executed,
+        "obs": obs,
+        "rewards": rewards,
+    }
