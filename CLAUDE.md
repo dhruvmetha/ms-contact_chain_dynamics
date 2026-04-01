@@ -121,7 +121,7 @@ ctx.push(approach_pose, push_pose)
 ```
 
 **cuRobo + EE control skills** — standalone classes for GPU-batched operation:
-- **`StickPush`** (`taskbench/skills/stick_push.py`) — 5-phase push: stage (cuRobo) → insert → sweep → nudge-back → retract → smooth-rest. Active orientation correction at every step. Works single-env and GPU-batched (128+ envs).
+- **`StickPush`** (`taskbench/skills/stick_push.py`) — 6-phase push: stage (cuRobo) → insert → sweep → nudge-back → retract → pullback+rest. Active orientation correction (`target_quaternions`) at every EE step. Return via EE pullback (no cuRobo) + smooth joint interpolation. Works single-env and GPU-batched (128+ envs).
 
 ```python
 push = StickPush(env, motion_gen, robot_uid="panda_stick_long",
