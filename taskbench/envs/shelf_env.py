@@ -137,13 +137,13 @@ class ShelfEnv(TaskEnv):
             [g.front_x - 0.20, 0.35, mid_z + 0.10],
             [g.center_x, 0.0, mid_z],
         )
-        # Close top-down: tight on the shelf interior
-        top_close = sapien_utils.look_at(
-            [g.center_x, 0.001, g.ceil_z + 0.40],
-            [g.center_x, 0, g.surface_z],
+        # Wide top-down: shows robot + shelf
+        wide_top = sapien_utils.look_at(
+            [g.front_x - 0.15, 0.001, g.ceil_z + 0.60],
+            [g.front_x + 0.05, 0, g.surface_z],
         )
         return [
-            CameraConfig("render_topdown", top_close, 512, 512, 0.9, 0.01, 100),
+            CameraConfig("render_topdown", wide_top, 512, 512, 1.2, 0.01, 100),
         ]
 
     # ------------------------------------------------------------------

@@ -128,51 +128,99 @@ class StickPush:
             StickPushResult with per-env telemetry.
         """
         total_steps = 0
+        eef_trace = []  # track TCP position every step
+
+        def _record_eef():
+            tcp = self.raw.agent.tcp.pose.p[0].cpu().numpy().copy()
+            eef_trace.append(tcp)
+
+        def _tracking_callback(step, obs, rew):
+            _record_eef()
+            if step_callback is not None:
+                step_callback(step, obs, rew)
+
+        def _log_orientation(label):
+            q = self.raw.agent.tcp.pose.q  # (N, 4)
+            q_ref = approach_quaternions.to(self.device)
+            dots = torch.abs(torch.sum(q * q_ref, dim=1))
+            drift = 1.0 - torch.clamp(dots, max=1.0)
+            tcp = self.raw.agent.tcp.pose.p[0].cpu().numpy()
+            quat = q[0].cpu().numpy()
+            logger.info("  %s: TCP=[%.3f,%.3f,%.3f] quat=[%.3f,%.3f,%.3f,%.3f] drift=%.4f",
+                        label, *tcp, *quat, drift.mean().item())
 
         # --- Phase 1: Stage (cuRobo, pd_joint_pos) ---
         staging_success, staging_steps = self._stage(
             approach_positions, approach_quaternions,
             max_attempts=staging_max_attempts,
             timeout=staging_timeout,
-            step_callback=step_callback,
+            step_callback=_tracking_callback,
         )
         total_steps += staging_steps
+        _log_orientation("After stage")
 
         # --- Phase 2: Insert (pd_ee_delta_pose) ---
         self.raw.agent.set_control_mode("pd_ee_delta_pose")
         self.raw.agent.controller.reset()
+        _log_orientation("After mode switch (before insert)")
 
         entry_result = batched_ee_delta_move(
             self.env, entry_positions,
+            target_quaternions=approach_quaternions,
             max_steps=entry_max_steps, max_delta=max_delta,
             convergence_threshold=convergence_threshold,
-            step_callback=step_callback,
+            step_callback=_tracking_callback,
         )
         total_steps += entry_result["steps_executed"]
         logger.info("  Insert: %d steps, mean_dist=%.4f, converged=%d/%d",
                      entry_result["steps_executed"],
                      entry_result["final_dists"].mean().item(),
                      entry_result["converged"].sum().item(), self.n_envs)
+        _log_orientation("After insert")
 
         # --- Phase 3: Sweep (pd_ee_delta_pose) ---
         sweep_result = batched_ee_delta_move(
             self.env, sweep_positions,
+            target_quaternions=approach_quaternions,
             max_steps=sweep_max_steps, max_delta=max_delta,
             convergence_threshold=convergence_threshold,
-            step_callback=step_callback,
+            step_callback=_tracking_callback,
         )
         total_steps += sweep_result["steps_executed"]
         logger.info("  Sweep: %d steps, mean_dist=%.4f, converged=%d/%d",
                      sweep_result["steps_executed"],
                      sweep_result["final_dists"].mean().item(),
                      sweep_result["converged"].sum().item(), self.n_envs)
+        _log_orientation("After sweep")
 
         # --- Phase 4: Retract (pd_ee_delta_pose) ---
+        # 4a: Small reverse along sweep direction to disengage from cylinders
+        tcp_now = self.raw.agent.tcp.pose.p.clone()
+        sweep_dir = (sweep_positions.to(self.device) - entry_positions.to(self.device))
+        sweep_len = torch.norm(sweep_dir, dim=1, keepdim=True).clamp(min=1e-6)
+        sweep_unit = sweep_dir / sweep_len
+        nudge_back = tcp_now - sweep_unit * 0.03  # 3cm back along sweep direction
+        nudge_back[:, 2] = tcp_now[:, 2]  # keep same z
+        batched_ee_delta_move(
+            self.env, nudge_back,
+            target_quaternions=approach_quaternions,
+            max_steps=20, max_delta=max_delta,
+            convergence_threshold=convergence_threshold,
+            step_callback=_tracking_callback,
+        )
+        total_steps += 20
+
+        # 4b: Pull straight out from current position (just change X)
+        tcp_after_nudge = self.raw.agent.tcp.pose.p.clone()
+        retract_from_here = tcp_after_nudge.clone()
+        retract_from_here[:, 0] = retract_positions.to(self.device)[:, 0]  # pull X to outside shelf
+        retract_from_here[:, 2] = retract_positions.to(self.device)[:, 2]  # keep target Z
         retract_result = batched_ee_delta_move(
-            self.env, retract_positions,
+            self.env, retract_from_here,
+            target_quaternions=approach_quaternions,
             max_steps=retract_max_steps, max_delta=max_delta,
             convergence_threshold=convergence_threshold,
-            step_callback=step_callback,
+            step_callback=_tracking_callback,
         )
         total_steps += retract_result["steps_executed"]
         logger.info("  Retract: %d steps, mean_dist=%.4f, converged=%d/%d",
@@ -180,27 +228,46 @@ class StickPush:
                      retract_result["final_dists"].mean().item(),
                      retract_result["converged"].sum().item(), self.n_envs)
 
-        # Check orientation drift
+        _log_orientation("After retract")
+
+        # Orientation correction is built into every EE delta step
+        # (insert, sweep, retract all actively track target_quaternions)
         q = self.raw.agent.tcp.pose.q  # (N, 4)
         q_ref = approach_quaternions.to(self.device)
         dots = torch.abs(torch.sum(q * q_ref, dim=1))
         orientation_drift = 1.0 - torch.clamp(dots, max=1.0)
 
-        # --- Phase 5: Rest (pd_joint_pos) ---
+        # --- Phase 5: Smooth return to safe start qpos for next staging ---
         self.raw.agent.set_control_mode("pd_joint_pos")
         self.raw.agent.controller.reset()
 
-        rest = torch.tensor(
-            self.rest_qpos, device=self.device, dtype=torch.float32
+        current_qpos = self.raw.agent.robot.get_qpos()[:, :self.n_arm].clone()
+        safe_target = torch.tensor(
+            self.safe_start_qpos, device=self.device, dtype=torch.float32
         ).unsqueeze(0).expand(self.n_envs, -1)
-        for _ in range(rest_steps):
-            self.env.step(rest)
+        for i in range(rest_steps):
+            alpha = min((i + 1) / rest_steps, 1.0)
+            interp = current_qpos + alpha * (safe_target - current_qpos)
+            self.env.step(interp)
+            _record_eef()
             if step_callback is not None:
                 step_callback(0, None, None)
         total_steps += rest_steps
+        logger.info("  Rest: %d steps, orient_drift=%.4f", rest_steps, orientation_drift.mean().item())
 
-        logger.info("  Rest: %d steps, orient_drift=%.4f",
-                     rest_steps, orientation_drift.mean().item())
+        # Dump EEF trace summary
+        import numpy as np
+        trace = np.array(eef_trace)
+        if len(trace) > 0:
+            # Find big jumps (>5cm between consecutive frames)
+            diffs = np.linalg.norm(np.diff(trace, axis=0), axis=1)
+            jumps = np.where(diffs > 0.05)[0]
+            logger.info("  EEF trace: %d frames, x=[%.3f,%.3f], y=[%.3f,%.3f], z=[%.3f,%.3f]",
+                        len(trace), trace[:,0].min(), trace[:,0].max(),
+                        trace[:,1].min(), trace[:,1].max(),
+                        trace[:,2].min(), trace[:,2].max())
+            if len(jumps) > 0:
+                logger.info("  EEF JUMPS >5cm at frames: %s", jumps.tolist()[:10])
 
         # Overall success: staging + sweep converged
         success_mask = staging_success & sweep_result["converged"]
@@ -235,7 +302,7 @@ class StickPush:
         N = self.n_envs
         n_arm = self.n_arm
 
-        # Build start state (safe qpos that passes cuRobo self-collision)
+        # Use safe start qpos that passes cuRobo self-collision check
         start_pos = torch.tensor(
             self.safe_start_qpos, device=self.cuda, dtype=torch.float32
         ).unsqueeze(0).expand(N, -1).clone()

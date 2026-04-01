@@ -735,22 +735,28 @@ def batched_ee_delta_move(
     env,
     target_positions: torch.Tensor,
     *,
+    target_quaternions: Optional[torch.Tensor] = None,
     max_steps: int = 100,
     max_delta: float = 0.03,
+    max_rot_delta: float = 0.05,
     convergence_threshold: float = 0.003,
     step_callback=None,
 ) -> dict:
     """Drive N TCPs to target positions using pd_ee_delta_pose control.
 
     Assumes the env is already in ``pd_ee_delta_pose`` control mode.
-    Position deltas are clipped per step; rotation deltas are zero
-    (maintains current orientation). Exits early when all envs converge.
+    Position deltas are clipped per step. If ``target_quaternions`` is
+    provided, actively corrects orientation via rotation deltas.
+    Otherwise rotation deltas are zero (maintains current orientation).
 
     Args:
         env: ManiSkill env (single or GPU-vectorized).
         target_positions: (N, 3) world-frame target positions.
+        target_quaternions: Optional (N, 4) wxyz target orientation.
+            If provided, computes rotation deltas to drive toward it.
         max_steps: Maximum number of steps before giving up.
         max_delta: Per-step position delta clipping bound.
+        max_rot_delta: Per-step rotation delta clipping bound.
         convergence_threshold: Distance below which an env is converged.
         step_callback: Optional ``(step, obs, rewards) -> None``.
 
@@ -766,6 +772,7 @@ def batched_ee_delta_move(
     device = raw.device
     targets = target_positions.to(device)
     n_envs = targets.shape[0]
+    q_ref = target_quaternions.to(device) if target_quaternions is not None else None
 
     obs = rewards = None
     steps_executed = 0
@@ -780,7 +787,22 @@ def batched_ee_delta_move(
         delta = torch.clamp(targets - tcp, -max_delta, max_delta)
         action = torch.zeros(n_envs, 6, device=device)
         action[:, :3] = delta
-        # rotation deltas = 0 → maintain current orientation
+
+        # Orientation correction: quaternion error → small euler deltas
+        if q_ref is not None:
+            q_cur = raw.agent.tcp.pose.q  # (N, 4) wxyz
+            # q_err = q_ref * conj(q_cur)
+            q_inv = q_cur.clone()
+            q_inv[:, 1:] = -q_inv[:, 1:]
+            w1, x1, y1, z1 = q_ref[:, 0], q_ref[:, 1], q_ref[:, 2], q_ref[:, 3]
+            w2, x2, y2, z2 = q_inv[:, 0], q_inv[:, 1], q_inv[:, 2], q_inv[:, 3]
+            # Small angle approximation: euler ≈ 2 * imaginary part of q_err
+            rot_delta = 2.0 * torch.stack([
+                w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                w1*z2 + x1*y2 - y1*x2 + z1*w2,
+            ], dim=1)
+            action[:, 3:6] = torch.clamp(rot_delta, -max_rot_delta, max_rot_delta)
 
         obs, rewards, _, _, _ = env.step(action)
         steps_executed = step + 1
