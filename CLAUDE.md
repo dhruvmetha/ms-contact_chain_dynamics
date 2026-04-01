@@ -112,32 +112,47 @@ Envs define the scene and success criterion. They don't compute trajectories —
 
 ### Skill System
 
-Skills are composable objects (`Pick`, `Place`, `Move`, `Push`) in `taskbench/skills/primitives.py`. Use `SkillContext` to eliminate boilerplate:
+**mplib skills** (`Pick`, `Place`, `Move`, `Push`) in `taskbench/skills/primitives.py`. Use `SkillContext` for single-env CPU:
 ```python
 ctx = SkillContext(env)
 ctx.reset(seed=42)
-ctx.step_callback = recorder.record  # propagates to all skills
-ctx.pick("cube_1")
-ctx.place(target_pose)
+ctx.step_callback = recorder.record
+ctx.push(approach_pose, push_pose)
 ```
 
-`SkillContext.initialize()` sets up planner/objects without resetting the env — useful for search-based solvers that manage their own resets.
+**cuRobo + EE control skills** — standalone classes for GPU-batched operation:
+- **`StickPush`** (`taskbench/skills/stick_push.py`) — 5-phase push: stage (cuRobo) → insert → sweep → nudge-back → retract → smooth-rest. Active orientation correction at every step. Works single-env and GPU-batched (128+ envs).
+
+```python
+push = StickPush(env, motion_gen, robot_uid="panda_stick_long",
+                 n_envs=N, rest_qpos=REST, robot_base_pos=base,
+                 safe_start_qpos=SAFE)
+result = push(approach, quat, entry, sweep, retract)
+# result.success_mask, .sweep_final_dist, .orientation_drift
+```
+
+**`batched_ee_delta_move()`** in `curobo_motion.py` — drives N TCPs to targets using `pd_ee_delta_pose` with optional `target_quaternions` for active orientation correction.
 
 Robot-specific constants live in `RobotConfig` (`taskbench/skills/robot_config.py`), not hardcoded. Skills accept `PoseLike` (tuples or `sapien.Pose`) and resolve objects by string name.
 
 ### Key Modules
 
 - **`configs/default.yaml`** — Hydra config with `task:`, `runtime:`, `run:` sections.
-- **`taskbench/envs/factory.py`** — `make_env(cfg)` (vectorized) and `make_single_env(cfg)` (raw, for motion planner). Reads `cfg.task` for env kwargs, `cfg.runtime` for framework params.
+- **`taskbench/envs/factory.py`** — `make_env(cfg)` (vectorized), `make_single_env(cfg)` (raw), `cleanup_env()` (GPU memory leak fix).
 - **`taskbench/envs/base.py`** — `TaskEnv` base class: intercepts `robot_base_pose` from kwargs, provides `_default_initial_agent_poses()` and `_reset_robot()`, abstract `get_objects()`.
+- **`taskbench/envs/shelf_env.py`** — `ShelfEnv`: enclosed shelf with cylinders, per-env random count (1-N) and non-overlapping placement.
 - **`taskbench/solver.py`** — `BaseSolver` ABC, `SolverResult`, `@register_solver`, `discover_solvers()`.
 - **`taskbench/skills/robot_config.py`** — `RobotConfig` dataclass + `get_robot_config()` (auto-discovers from agent classes).
-- **`taskbench/agents/`** — Pluggable robot agents. Auto-discovered via `discover_agents()` (pkgutil pattern).
-- **`taskbench/skills/context.py`** — `SkillContext` — bundles env + planner + objects + skills.
-- **`taskbench/skills/motion.py`** — Low-level mplib helpers: `setup_planner()`, `move_to_pose()` (straight-line screw interpolation, no RRT), `build_action()`, `PoseLike`.
-- **`taskbench/skills/primitives.py`** — Composable skill objects with `SkillResult` dataclasses.
+- **`taskbench/agents/`** — Pluggable robot agents. Includes `panda_stick_long.py` (25cm stick, no gripper).
+- **`taskbench/skills/context.py`** — `SkillContext` — bundles env + planner + objects + skills (mplib).
+- **`taskbench/skills/stick_push.py`** — `StickPush` skill (cuRobo + EE control, GPU-batched).
+- **`taskbench/skills/curobo_motion.py`** — GPU-batched motion: `setup_curobo_planner()`, `batched_ee_delta_move()`, `batched_follow_path()`, `batched_move_to_pose()`.
+- **`taskbench/skills/motion.py`** — Low-level mplib helpers: `setup_planner()`, `move_to_pose()`, `build_action()`, `PoseLike`.
+- **`taskbench/skills/primitives.py`** — Composable skill objects with `SkillResult` dataclasses (mplib).
 - **`taskbench/recorder.py`** — `StateRecorder` for capturing simulation state to HDF5.
 - **`taskbench/logger.py`** — Optional WandB logging wrapper.
+- **`scripts/test_gpu_parallel.py`** — GPU-batched multi-push data collection using `StickPush`.
+- **`tests/skills/test_stick_push.py`** — 12 tests (unit, integration, regression).
 
 ### Critical Constraints (mplib / ManiSkill)
 
@@ -146,3 +161,15 @@ Robot-specific constants live in `RobotConfig` (`taskbench/skills/robot_config.p
 - **Motion planner requires**: `num_envs=1`, `sim_backend="cpu"`, `pd_joint_pos` control mode, no `ManiSkillVectorEnv` wrapper.
 - **Video recording with planner**: Must use `save_on_reset=False` on `RecordEpisode` and call `env.flush_video()` manually.
 - **numpy < 2.0** required by mplib 0.2.1.
+
+### Critical Constraints (cuRobo / GPU parallel)
+
+- **cuRobo self-collision**: Exact REST_QPOS `[0,-1.3,0,-2.5,0,1,0]` fails self-collision check. Use SAFE_QPOS (slightly drifted).
+- **cuRobo `plan_batch`**: crashes if 0/N IK succeed (known bug). Check `n_success > 0` before accessing trajectories.
+- **cuRobo tensors**: `.clone()` all tensors passed between episodes (internal buffer reuse conflict).
+- **GPU env control mode switching**: `raw.agent.set_control_mode(mode)` + `raw.agent.controller.reset()`.
+- **GPU per-env poses**: Use `Pose.create_from_pq(p=(N,3), q=(4,))` — auto-broadcasts, auto-masks to env_idx.
+- **GPU per-env markers**: Can't add actors to individual sub_scenes (tensor shape mismatch).
+- **GPU video recording**: Requires `max_steps_per_video` param in `RecordEpisode`.
+- **SAPIEN GPU memory leak**: Call `cleanup_env()` from `taskbench/envs/factory.py` after `env.close()`.
+- **srun**: Use `--partition=unlimited`, don't set `--mem` (default UNLIMITED). Set `CUDA_HOME=/usr/local/cuda-12.6` and `CPATH=.../targets/x86_64-linux/include`.
