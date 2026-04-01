@@ -61,9 +61,12 @@ def make_env(cfg):
     )
 
     if rt.record_video and rt.render_mode != "human":
+        from datetime import datetime
+        video_dir = rt.get("video_dir", "videos")
+        video_dir = f"{video_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         env = RecordEpisode(
             env,
-            output_dir=rt.get("video_dir", "videos"),
+            output_dir=video_dir,
             save_trajectory=False,
             save_video=True,
             max_steps_per_video=rt.max_episode_steps,
@@ -97,9 +100,12 @@ def make_batched_env(cfg):
     )
 
     if rt.record_video and rt.render_mode != "human":
+        from datetime import datetime
+        video_dir = rt.get("video_dir", "videos")
+        video_dir = f"{video_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_batched"
         env = RecordEpisode(
             env,
-            output_dir=rt.get("video_dir", "videos"),
+            output_dir=video_dir,
             save_trajectory=False,
             save_video=True,
             save_on_reset=False,
@@ -135,9 +141,12 @@ def make_single_env(cfg):
     )
 
     if rt.record_video and rt.render_mode != "human":
+        from datetime import datetime
+        video_dir = rt.get("video_dir", "videos")
+        video_dir = f"{video_dir}/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         env = RecordEpisode(
             env,
-            output_dir=rt.get("video_dir", "videos"),
+            output_dir=video_dir,
             save_trajectory=False,
             save_video=True,
             save_on_reset=False,
