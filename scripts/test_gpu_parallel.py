@@ -204,7 +204,7 @@ for ep in range(N_EPISODES):
             np.full(N, SHELF["front_x"] - 0.05), p1_np[:, 1], np.full(N, PUSH_Z),
         ], axis=1)
         retract_np = np.stack([
-            np.full(N, SHELF["front_x"] - 0.05), p2_np[:, 1], np.full(N, PUSH_Z),
+            np.full(N, SHELF["front_x"] - 0.30), p2_np[:, 1], np.full(N, PUSH_Z),
         ], axis=1)
 
         print(f"  Push {push_idx+1}/{N_PUSHES}:")

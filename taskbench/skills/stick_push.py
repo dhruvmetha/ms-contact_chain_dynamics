@@ -230,30 +230,18 @@ class StickPush:
 
         _log_orientation("After retract")
 
-        # Orientation correction is built into every EE delta step
-        # (insert, sweep, retract all actively track target_quaternions)
         q = self.raw.agent.tcp.pose.q  # (N, 4)
         q_ref = approach_quaternions.to(self.device)
         dots = torch.abs(torch.sum(q * q_ref, dim=1))
         orientation_drift = 1.0 - torch.clamp(dots, max=1.0)
 
-        # --- Phase 5: Smooth return to safe start qpos for next staging ---
-        self.raw.agent.set_control_mode("pd_joint_pos")
-        self.raw.agent.controller.reset()
-
-        current_qpos = self.raw.agent.robot.get_qpos()[:, :self.n_arm].clone()
-        safe_target = torch.tensor(
-            self.safe_start_qpos, device=self.device, dtype=torch.float32
-        ).unsqueeze(0).expand(self.n_envs, -1)
-        for i in range(rest_steps):
-            alpha = min((i + 1) / rest_steps, 1.0)
-            interp = current_qpos + alpha * (safe_target - current_qpos)
-            self.env.step(interp)
-            _record_eef()
-            if step_callback is not None:
-                step_callback(0, None, None)
-        total_steps += rest_steps
-        logger.info("  Rest: %d steps, orient_drift=%.4f", rest_steps, orientation_drift.mean().item())
+        # --- Phase 5: Return to rest (EE pullback + joint interpolation) ---
+        self._return_to_rest(
+            approach_quaternions=approach_quaternions,
+            step_callback=_tracking_callback,
+        )
+        total_steps += rest_steps  # approximate
+        logger.info("  Rest: orient_drift=%.4f", orientation_drift.mean().item())
 
         # Dump EEF trace summary
         import numpy as np
@@ -367,3 +355,44 @@ class StickPush:
                 step_callback(0, None, None)
 
         return staging_success.to(self.device), T + settle
+
+    def _return_to_rest(self, *, approach_quaternions=None, step_callback=None):
+        """Pull stick straight back via EE control, then smooth joint interpolation to rest.
+
+        Two phases:
+        1. EE delta: pull TCP straight back in -X to well behind the shelf
+           (no path planning needed — just straight line away from shelf)
+        2. pd_joint_pos: smooth interpolation from current qpos to SAFE_QPOS
+           (arm is now behind the shelf, so interpolation is safe)
+        """
+        N = self.n_envs
+
+        # Phase 1: EE pull-back to robot base X (well behind shelf)
+        # Still in pd_ee_delta_pose mode from retract
+        tcp = self.raw.agent.tcp.pose.p.clone()
+        pullback_target = tcp.clone()
+        pullback_target[:, 0] = self.robot_base_pos[0, 0].item() + 0.10  # just in front of robot base
+        batched_ee_delta_move(
+            self.env, pullback_target,
+            target_quaternions=approach_quaternions,
+            max_steps=80, max_delta=0.03,
+            convergence_threshold=0.01,
+            step_callback=step_callback,
+        )
+        logger.info("  Pull-back to x=%.3f", pullback_target[0, 0].item())
+
+        # Phase 2: Switch to joint control, smooth interpolation to SAFE_QPOS
+        self.raw.agent.set_control_mode("pd_joint_pos")
+        self.raw.agent.controller.reset()
+
+        current_qpos = self.raw.agent.robot.get_qpos()[:, :self.n_arm].clone()
+        safe_target = torch.tensor(
+            self.safe_start_qpos, device=self.device, dtype=torch.float32
+        ).unsqueeze(0).expand(N, -1)
+        for i in range(40):
+            alpha = min((i + 1) / 40, 1.0)
+            interp = current_qpos + alpha * (safe_target - current_qpos)
+            self.env.step(interp)
+            if step_callback is not None:
+                step_callback(0, None, None)
+        logger.info("  Rest interpolation: 40 steps")
