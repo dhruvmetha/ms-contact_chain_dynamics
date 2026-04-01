@@ -276,34 +276,42 @@ class ShelfEnv(TaskEnv):
         min_dist = self.cyl_spec.radius * 2.5  # no overlap
         b = len(env_idx)
 
+        # Random cylinder count per env (1 to num_objects)
+        counts = torch.randint(1, self.num_objects + 1, (b,), device=self.device)
+
         # Track placed positions for overlap rejection (b, i, 2)
         placed = torch.zeros(b, 0, 2, device=self.device)
 
         for i, obj in enumerate(self.shelf_objects):
-            # Rejection sample: generate candidates until no overlap
+            active = i < counts  # (b,) bool — is this cylinder active in each env?
+
             pos = torch.zeros(b, 3, device=self.device)
-            for _ in range(200):
-                # Random (x, y) per env
-                xy = torch.rand(b, 2, device=self.device)
-                xy[:, 0] = xy[:, 0] * (x_hi - x_lo) + x_lo
-                xy[:, 1] = xy[:, 1] * (y_hi - y_lo) + y_lo
 
-                if placed.shape[1] == 0:
-                    break  # first object, no overlap check needed
+            if active.any():
+                for _ in range(200):
+                    xy = torch.rand(b, 2, device=self.device)
+                    xy[:, 0] = xy[:, 0] * (x_hi - x_lo) + x_lo
+                    xy[:, 1] = xy[:, 1] * (y_hi - y_lo) + y_lo
 
-                # Check min distance to all previously placed objects
-                # placed: (b, i, 2), xy: (b, 2) -> (b, 1, 2)
-                diffs = placed - xy.unsqueeze(1)  # (b, i, 2)
-                dists = torch.norm(diffs, dim=2)   # (b, i)
-                min_dists = dists.min(dim=1).values  # (b,)
-                if (min_dists > min_dist).all():
-                    break
+                    if placed.shape[1] == 0:
+                        break
 
-            pos[:, 0] = xy[:, 0]
-            pos[:, 1] = xy[:, 1]
-            pos[:, 2] = z
+                    diffs = placed - xy.unsqueeze(1)
+                    dists_2d = torch.norm(diffs, dim=2)
+                    min_neighbor = dists_2d.min(dim=1).values
+                    if (min_neighbor[active] > min_dist).all():
+                        break
+
+                pos[active, 0] = xy[active, 0]
+                pos[active, 1] = xy[active, 1]
+                pos[active, 2] = z
+
+            # Hide inactive cylinders far off to the side (out of camera/physics)
+            pos[~active, 0] = 5.0
+            pos[~active, 1] = 5.0
+            pos[~active, 2] = z
+
             placed = torch.cat([placed, xy.unsqueeze(1)], dim=1)
-
             obj.set_pose(MSPose.create_from_pq(p=pos, q=CYL_UPRIGHT_Q))
 
     # ------------------------------------------------------------------
