@@ -73,6 +73,43 @@ def make_env(cfg):
     return env
 
 
+def make_batched_env(cfg):
+    """Create a GPU-vectorized env for batched solvers.
+
+    Like ``make_env`` but without ``ManiSkillVectorEnv`` wrapper
+    (batched solvers manage resets directly to avoid partial-reset conflicts).
+    """
+    rt = cfg.runtime
+    need_render = rt.record_video or rt.render_mode == "human"
+    render_mode = rt.render_mode if need_render else None
+
+    kwargs = _task_kwargs(cfg)
+
+    env = gym.make(
+        cfg.task.env_id,
+        obs_mode=rt.obs_mode,
+        control_mode=rt.control_mode,
+        reward_mode=rt.reward_mode,
+        num_envs=rt.num_envs,
+        max_episode_steps=rt.max_episode_steps,
+        render_mode=render_mode,
+        **kwargs,
+    )
+
+    if rt.record_video and rt.render_mode != "human":
+        env = RecordEpisode(
+            env,
+            output_dir=rt.get("video_dir", "videos"),
+            save_trajectory=False,
+            save_video=True,
+            save_on_reset=False,
+            video_fps=30,
+            max_steps_per_video=rt.get("max_steps_per_video", 3000),
+        )
+
+    return env
+
+
 def make_single_env(cfg):
     """Create a single raw gym env for use with the motion planner.
 

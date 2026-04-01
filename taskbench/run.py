@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from taskbench.envs.factory import make_env, make_single_env
+from taskbench.envs.factory import make_env, make_single_env, make_batched_env
 from taskbench.logger import Logger
 
 
@@ -94,7 +94,7 @@ def run_batched(config, logger: Logger):
     solver_kwargs = OmegaConf.select(config.run, "solver_kwargs", default={}) or {}
     solver = get_solver(config.run.solver, **solver_kwargs)
 
-    env = make_env(config)
+    env = make_batched_env(config)
     recording = config.runtime.record_video
     target_episodes = config.run.num_episodes
 

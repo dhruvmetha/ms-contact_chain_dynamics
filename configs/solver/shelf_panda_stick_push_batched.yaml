@@ -1,0 +1,10 @@
+# @package _global_
+run:
+  solver: shelf_panda_stick_push_batched
+  batched: true
+  solver_kwargs:
+    pushes_per_episode: 3
+
+runtime:
+  control_mode: pd_joint_pos
+  num_envs: 64
