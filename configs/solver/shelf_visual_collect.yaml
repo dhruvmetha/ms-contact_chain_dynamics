@@ -1,0 +1,46 @@
+# @package _global_
+#
+# Visual data collection solver for shelf pushing.
+#
+# Collects per-frame RGB, depth, segmentation masks, camera params,
+# robot state, and object poses during GPU-batched stick pushes.
+#
+# Usage:
+#   uv run python -m taskbench.run task=shelf_panda_stick solver=shelf_visual_collect
+#
+# Override examples:
+#   task.camera_names='[top_camera]'            # top-down only
+#   task.camera_width=128 task.camera_height=128 # lower resolution
+#   run.solver_kwargs.n_collect_envs=8           # collect from more envs
+#   run.solver_kwargs.output_dir=data/my_exp     # custom output dir
+#   runtime.num_envs=32                          # more parallel envs
+#
+# Parallel collection (see scripts/launch_visual_collect.sh):
+#   run.solver_kwargs.worker_id=0               # unique per worker, enables resume
+#   seed=10042                                  # unique seed per worker
+
+run:
+  solver: shelf_visual_collect
+  batched: true
+  num_episodes: 5
+  solver_kwargs:
+    pushes_per_episode: 3
+    n_collect_envs: -1  # -1 = collect from all envs (default)
+    output_dir: /common/users/shared/robot_learning/dm1487/wm/datasets/shelf_push_20260407
+    worker_id: -1  # -1 = timestamped dir; >=0 = worker_NNN dir (for parallel jobs)
+    collect_mode: zarr  # "zarr" = (s, a, s') pairs to zarr, "full" = all frames to MP4+HDF5
+
+task:
+  num_objects: 8
+  distinct_colors: true
+  camera_names:
+    - top_camera
+  camera_width: 256
+  camera_height: 256
+
+runtime:
+  control_mode: pd_joint_pos
+  obs_mode: "rgb+depth+segmentation"
+  render_mode: rgb_array
+  num_envs: 16
+  record_video: false

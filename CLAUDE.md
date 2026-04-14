@@ -143,7 +143,7 @@ Robot-specific constants live in `RobotConfig` (`taskbench/skills/robot_config.p
 - **`taskbench/envs/shelf_env.py`** — `ShelfEnv`: enclosed shelf with cylinders, per-env random count (1-N) and non-overlapping placement.
 - **`taskbench/solver.py`** — `BaseSolver` ABC, `SolverResult`, `@register_solver`, `discover_solvers()`.
 - **`taskbench/skills/robot_config.py`** — `RobotConfig` dataclass + `get_robot_config()` (auto-discovers from agent classes).
-- **`taskbench/agents/`** — Pluggable robot agents. Includes `panda_stick_long.py` (25cm stick, no gripper).
+- **`taskbench/agents/`** — Pluggable robot agents. Includes `panda_stick_long.py` (25cm stick, 5mm radius, no gripper).
 - **`taskbench/skills/context.py`** — `SkillContext` — bundles env + planner + objects + skills (mplib).
 - **`taskbench/skills/stick_push.py`** — `StickPush` skill (cuRobo + EE control, GPU-batched).
 - **`taskbench/skills/curobo_motion.py`** — GPU-batched motion: `setup_curobo_planner()`, `batched_ee_delta_move()`, `batched_follow_path()`, `batched_move_to_pose()`.
