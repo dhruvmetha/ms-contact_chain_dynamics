@@ -10,6 +10,17 @@ from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 import taskbench.envs  # noqa: F401 — register custom envs
 
 
+def _resolved_render_mode(runtime_cfg):
+    """Return a render mode acceptable by gym.make, or None to disable rendering."""
+    mode = runtime_cfg.get("render_mode", None)
+    if mode is None:
+        return None
+    mode_str = str(mode).strip().lower()
+    if mode_str in ("", "none", "null"):
+        return None
+    return mode
+
+
 def cleanup_env(env):
     """Close a ManiSkill env and free all GPU resources.
 
@@ -44,8 +55,7 @@ def _task_kwargs(cfg):
 def make_env(cfg):
     """Create a vectorized ManiSkill env with optional video recording."""
     rt = cfg.runtime
-    need_render = rt.record_video or rt.render_mode == "human"
-    render_mode = rt.render_mode if need_render else None
+    render_mode = _resolved_render_mode(rt)
 
     kwargs = _task_kwargs(cfg)
 
@@ -83,8 +93,7 @@ def make_batched_env(cfg):
     (batched solvers manage resets directly to avoid partial-reset conflicts).
     """
     rt = cfg.runtime
-    need_render = rt.record_video or rt.render_mode == "human"
-    render_mode = rt.render_mode if need_render else None
+    render_mode = _resolved_render_mode(rt)
 
     kwargs = _task_kwargs(cfg)
 
@@ -123,8 +132,7 @@ def make_single_env(cfg):
     access ``env.unwrapped`` attributes directly.
     """
     rt = cfg.runtime
-    need_render = rt.record_video or rt.render_mode == "human"
-    render_mode = rt.render_mode if need_render else None
+    render_mode = _resolved_render_mode(rt)
 
     kwargs = _task_kwargs(cfg)
 

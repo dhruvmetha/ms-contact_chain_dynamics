@@ -13,7 +13,11 @@ videos/
 videos_old/
 replay_videos/
 data/
+artifacts/
+tmp_images/
 
 # OS
 .DS_Store
 
+.hydra/
+multirun/

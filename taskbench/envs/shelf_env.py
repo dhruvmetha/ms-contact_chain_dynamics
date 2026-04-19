@@ -244,7 +244,8 @@ class ShelfEnv(TaskEnv):
         if self.num_objects > 0:
             r = self.cyl_spec.radius
             hl = self.cyl_spec.half_length
-            self.target_idx = self.np_random.integers(0, self.num_objects)
+            rng0 = self._batched_episode_rng[0]
+            self.target_idx = int(rng0.randint(0, self.num_objects))
             for i in range(self.num_objects):
                 color = RED_COLOR if i == self.target_idx else BLUE_COLOR
                 cyl_mat = sapien.render.RenderMaterial(base_color=color)
@@ -275,9 +276,16 @@ class ShelfEnv(TaskEnv):
         z = g.surface_z + self.cyl_spec.half_length
         min_dist = self.cyl_spec.radius * 2.5  # no overlap
         b = len(env_idx)
+        env_idx_np = env_idx.detach().cpu().numpy()
+        rng = self._batched_episode_rng[env_idx_np]
 
-        # Random cylinder count per env (1 to num_objects)
-        counts = torch.randint(1, self.num_objects + 1, (b,), device=self.device)
+        # Random cylinder count per env (1..num_objects), sampled from the
+        # ManiSkill episode RNG so repeated reset(seed=...) is deterministic.
+        # Ensure target is active.
+        counts_np = rng.randint(1, self.num_objects + 1)
+        counts_np = np.asarray(counts_np, dtype=np.int32).reshape(b)
+        counts_np = np.maximum(counts_np, self.target_idx + 1)
+        counts = torch.from_numpy(counts_np).to(device=self.device, dtype=torch.int64)
 
         # Track placed positions for overlap rejection (b, i, 2)
         placed = torch.zeros(b, 0, 2, device=self.device)
@@ -286,17 +294,22 @@ class ShelfEnv(TaskEnv):
             active = i < counts  # (b,) bool — is this cylinder active in each env?
 
             pos = torch.zeros(b, 3, device=self.device)
+            xy = torch.zeros(b, 2, device=self.device)
 
             if active.any():
                 for _ in range(200):
-                    xy = torch.rand(b, 2, device=self.device)
-                    xy[:, 0] = xy[:, 0] * (x_hi - x_lo) + x_lo
-                    xy[:, 1] = xy[:, 1] * (y_hi - y_lo) + y_lo
+                    xy_np = np.asarray(rng.uniform(size=(2,)), dtype=np.float32)
+                    if xy_np.ndim == 1:
+                        xy_np = xy_np.reshape(1, 2)
+                    xy_np[:, 0] = xy_np[:, 0] * (x_hi - x_lo) + x_lo
+                    xy_np[:, 1] = xy_np[:, 1] * (y_hi - y_lo) + y_lo
+                    xy_candidate = torch.from_numpy(xy_np).to(self.device)
+                    xy = xy_candidate
 
                     if placed.shape[1] == 0:
                         break
 
-                    diffs = placed - xy.unsqueeze(1)
+                    diffs = placed - xy_candidate.unsqueeze(1)
                     dists_2d = torch.norm(diffs, dim=2)
                     min_neighbor = dists_2d.min(dim=1).values
                     if (min_neighbor[active] > min_dist).all():

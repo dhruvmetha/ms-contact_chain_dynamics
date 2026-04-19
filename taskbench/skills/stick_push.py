@@ -159,13 +159,25 @@ class StickPush:
         total_steps += staging_steps
         _log_orientation("After stage")
 
+        # If stage failed for any env, do not drive that env through insert/sweep/retract.
+        # For failed envs we pin downstream targets to current TCP to avoid nonsensical motions.
+        entry_positions_eff = entry_positions.clone().to(self.device)
+        sweep_positions_eff = sweep_positions.clone().to(self.device)
+        retract_positions_eff = retract_positions.clone().to(self.device)
+        if (~staging_success).any():
+            tcp_now = self.raw.agent.tcp.pose.p.clone()
+            failed = ~staging_success.to(self.device)
+            entry_positions_eff[failed] = tcp_now[failed]
+            sweep_positions_eff[failed] = tcp_now[failed]
+            retract_positions_eff[failed] = tcp_now[failed]
+
         # --- Phase 2: Insert (pd_ee_delta_pose) ---
         self.raw.agent.set_control_mode("pd_ee_delta_pose")
         self.raw.agent.controller.reset()
         _log_orientation("After mode switch (before insert)")
 
         entry_result = batched_ee_delta_move(
-            self.env, entry_positions,
+            self.env, entry_positions_eff,
             target_quaternions=approach_quaternions,
             max_steps=entry_max_steps, max_delta=max_delta,
             convergence_threshold=convergence_threshold,
@@ -180,7 +192,7 @@ class StickPush:
 
         # --- Phase 3: Sweep (pd_ee_delta_pose) ---
         sweep_result = batched_ee_delta_move(
-            self.env, sweep_positions,
+            self.env, sweep_positions_eff,
             target_quaternions=approach_quaternions,
             max_steps=sweep_max_steps, max_delta=max_delta,
             convergence_threshold=convergence_threshold,
@@ -196,7 +208,7 @@ class StickPush:
         # --- Phase 4: Retract (pd_ee_delta_pose) ---
         # 4a: Small reverse along sweep direction to disengage from cylinders
         tcp_now = self.raw.agent.tcp.pose.p.clone()
-        sweep_dir = (sweep_positions.to(self.device) - entry_positions.to(self.device))
+        sweep_dir = (sweep_positions_eff.to(self.device) - entry_positions_eff.to(self.device))
         sweep_len = torch.norm(sweep_dir, dim=1, keepdim=True).clamp(min=1e-6)
         sweep_unit = sweep_dir / sweep_len
         nudge_back = tcp_now - sweep_unit * 0.03  # 3cm back along sweep direction
@@ -213,8 +225,8 @@ class StickPush:
         # 4b: Pull straight out from current position (just change X)
         tcp_after_nudge = self.raw.agent.tcp.pose.p.clone()
         retract_from_here = tcp_after_nudge.clone()
-        retract_from_here[:, 0] = retract_positions.to(self.device)[:, 0]  # pull X to outside shelf
-        retract_from_here[:, 2] = retract_positions.to(self.device)[:, 2]  # keep target Z
+        retract_from_here[:, 0] = retract_positions_eff.to(self.device)[:, 0]  # pull X to outside shelf
+        retract_from_here[:, 2] = retract_positions_eff.to(self.device)[:, 2]  # keep target Z
         retract_result = batched_ee_delta_move(
             self.env, retract_from_here,
             target_quaternions=approach_quaternions,

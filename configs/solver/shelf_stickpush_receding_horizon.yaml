@@ -1,0 +1,63 @@
+# @package _global_
+run:
+  solver: shelf_stickpush_receding_horizon
+  mode: single
+  solver_kwargs:
+    max_executions: 1000
+    max_depth: 256
+    clearance_radius: 0.10
+    heading_degrees: [0, 45, 90, 135, 180, 225, 270, 315]
+    x_approach_values: [0.07]
+    insertion_approach_backoff: 0.07
+    delta_len_fracs: [0.30, 0.60, 0.90]
+    contact_margin: 0.003
+    stick_radius: 0.004
+    min_push_len: 0.03
+    min_insertion_depth: 0.02
+    retract_backoff: 0.30
+    z_eps: 0.03
+    forbid_target_crossing: true
+    target_avoid_margin: 0.004
+    include_target_pushes: true
+    target_push_open_dir_bias: 0.5
+    target_push_direction_deltas_deg: [-180, -150, -210, -90, 90, 120, -120]
+    target_push_include_open_face_bias: true
+    target_push_top_k_directions: 3
+    target_push_wall_weight: 1.0
+    target_push_corridor_weight: 0.8
+    target_push_wall_penalty_weight: 0.05
+    use_wavefront_insertion_solver: true
+    insertion_grid_resolution: 0.003
+    insertion_grid_safety_eps: 0.0
+    insertion_endpoint_tolerance_cells: 2
+    insertion_max_source_trials: 64
+    max_target_shift_xy: 0.02
+    target_wall_margin: 0.01
+    prune_target_invalid_nodes: false
+    require_target_shift_limit_for_success: false
+    ucb_exploration_c: 1.2
+    ucb_untried_bonus: 1.0
+    ucb_solved_bonus: 10.0
+    visual_max_candidates_drawn: 300
+    visual_save_images: true
+    visual_save_frontier_csv: true
+    visual_replay_stride: 2
+    entry_max_steps: 200
+    sweep_max_steps: 200
+    retract_max_steps: 100
+    rest_steps: 60
+    convergence_threshold: 0.01
+    staging_max_attempts: 2
+    staging_timeout: 3.0
+    staging_fallback_enabled: true
+    staging_backoff_candidates: [0.05, 0.03, 0.09, 0.11]
+    staging_fallback_min_insertion_depth: 0.015
+    artifact_root: artifacts/stickpush_rh
+
+runtime:
+  control_mode: pd_joint_pos
+  num_envs: 1
+  obs_mode: state
+  reward_mode: none
+  render_mode: rgb_array
+  record_video: false
