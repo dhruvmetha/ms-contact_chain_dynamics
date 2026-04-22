@@ -70,3 +70,20 @@ def test_ucb_ignores_reward_sum_for_frontier_selection():
     worse.metrics = NodeMetrics(blockers=3, min_margin=0.01, deficit=0.3, pushes_used=0, solved=False)
     nodes = {0: better, 1: worse}
     assert ucb.select(nodes, [0, 1]) == 0
+
+
+def test_ranked_candidates_matches_select_and_exposes_lex_rank():
+    ucb = FrontierUCB(UCBConfig(exploration_c=0.2, untried_bonus=1.0, solved_bonus=10.0))
+    n0 = _node(0, untried=1, visits=1, reward=0.0)
+    n1 = _node(1, untried=1, visits=1, reward=0.0)
+    n2 = _node(2, untried=1, visits=5, reward=100.0)
+    n0.metrics = NodeMetrics(blockers=3, min_margin=0.01, deficit=0.3, pushes_used=0, solved=False)
+    n1.metrics = NodeMetrics(blockers=1, min_margin=0.10, deficit=0.0, pushes_used=0, solved=False)
+    n2.metrics = NodeMetrics(blockers=2, min_margin=0.05, deficit=0.1, pushes_used=0, solved=False)
+    nodes = {0: n0, 1: n1, 2: n2}
+
+    ranked = ucb.ranked_candidates(nodes, [0, 1, 2])
+    assert ranked
+    assert ranked[0]["node_id"] == ucb.select(nodes, [0, 1, 2])
+    assert {int(r["lex_rank"]) for r in ranked} == {0, 1, 2}
+    assert all("ucb_score" in r for r in ranked)
