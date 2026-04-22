@@ -61,3 +61,12 @@ def test_ucb_switches_when_first_node_has_no_untried():
     second = ucb.select(nodes, [0, 1])
     assert first != second
 
+
+def test_ucb_ignores_reward_sum_for_frontier_selection():
+    ucb = FrontierUCB(UCBConfig(exploration_c=0.0, untried_bonus=0.0, solved_bonus=10.0))
+    better = _node(0, untried=1, visits=5, reward=0.0)
+    worse = _node(1, untried=1, visits=1, reward=1e6)
+    better.metrics = NodeMetrics(blockers=1, min_margin=0.1, deficit=0.0, pushes_used=0, solved=False)
+    worse.metrics = NodeMetrics(blockers=3, min_margin=0.01, deficit=0.3, pushes_used=0, solved=False)
+    nodes = {0: better, 1: worse}
+    assert ucb.select(nodes, [0, 1]) == 0
