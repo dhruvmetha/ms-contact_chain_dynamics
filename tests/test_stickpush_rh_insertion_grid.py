@@ -81,6 +81,33 @@ def test_straight_insertion_solver_rejects_unreachable_target():
     assert plan is None
 
 
+def test_straight_insertion_fallback_recovers_feasible_source_outside_trial_budget():
+    # A front obstacle blocks opening rays near p1_y. A feasible diagonal source
+    # exists, but not within the first few nearest-y candidates.
+    front_obstacle = ObjectState(
+        name="front_obs",
+        center_xyz=np.array([0.235, 0.08, 0.41], dtype=np.float32),
+        radius=0.020,
+        is_target=False,
+        active=True,
+    )
+    scene = _scene_with_objects([front_obstacle])
+    cfg = SamplingConfig(
+        insertion_grid_resolution=0.003,
+        insertion_grid_safety_eps=0.0,
+        insertion_approach_backoff=0.07,
+        insertion_endpoint_tolerance_cells=2,
+        insertion_max_source_trials=8,  # intentionally too small for nearest-y only
+    )
+    grid = build_wavefront_grid(scene, cfg)
+    p1_xy = np.array([0.56, 0.08], dtype=np.float32)
+    plan = solve_straight_insertion(grid, scene, p1_xy, cfg)
+
+    assert plan is not None
+    assert abs(float(plan.source_xy[1]) - float(p1_xy[1])) > 0.02
+    assert line_collision_free(grid, plan.source_xy, p1_xy, allow_end_occupied=True)
+
+
 def test_world_to_cell_returns_none_out_of_bounds():
     scene = _scene_with_objects([])
     cfg = SamplingConfig(insertion_grid_resolution=0.003)
