@@ -1,8 +1,7 @@
-"""Deterministic straight-insertion feasibility via node-level wavefront."""
+"""Deterministic straight-insertion feasibility on occupancy grid."""
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -13,7 +12,7 @@ from taskbench.planners.stickpush_rh.types import SceneState
 
 @dataclass
 class WavefrontGrid:
-    """Configuration-space occupancy and source-distance map."""
+    """Configuration-space occupancy and opening entry candidates."""
 
     x_min: float
     x_max: float
@@ -23,10 +22,10 @@ class WavefrontGrid:
     nx: int
     ny: int
     occupied: np.ndarray  # (ny, nx) bool
-    dist: np.ndarray  # (ny, nx) int32, -1 = unreachable
     source_cells: np.ndarray  # (K, 2) int32 in (ix, iy)
     source_world_xy: np.ndarray  # (K, 2) float32
     r_eff: float
+    entry_x: float
 
 
 @dataclass
@@ -35,7 +34,8 @@ class StraightInsertionPlan:
 
     source_xy: np.ndarray  # (2,) on opening line (inside shelf)
     approach_backoff: float
-    wavefront_dist: int
+    sources_checked: int
+    sources_total: int
 
 
 def _grid_bounds(scene: SceneState, r_eff: float, resolution: float) -> tuple[float, float, float, float]:
@@ -102,11 +102,10 @@ def _build_occupancy(scene: SceneState, cfg: SamplingConfig) -> tuple[np.ndarray
 
 
 def build_wavefront_grid(scene: SceneState, cfg: SamplingConfig) -> WavefrontGrid:
-    """Build occupancy and one BFS wavefront from shelf opening."""
+    """Build occupancy and free opening-line source candidates."""
 
     occupied, x_min, x_max, y_min, y_max, r_eff = _build_occupancy(scene, cfg)
     ny, nx = occupied.shape
-    dist = -np.ones((ny, nx), dtype=np.int32)
 
     source_cells = []
     source_world = []
@@ -114,46 +113,20 @@ def build_wavefront_grid(scene: SceneState, cfg: SamplingConfig) -> WavefrontGri
     for iy in range(ny):
         if occupied[iy, ix_open]:
             continue
-        dist[iy, ix_open] = 0
         source_cells.append((ix_open, iy))
-
-    q: deque[tuple[int, int]] = deque(source_cells)
-    neighbors = [
-        (-1, -1),
-        (-1, 0),
-        (-1, 1),
-        (0, -1),
-        (0, 1),
-        (1, -1),
-        (1, 0),
-        (1, 1),
-    ]
-    while q:
-        ix, iy = q.popleft()
-        d = int(dist[iy, ix])
-        for dx, dy in neighbors:
-            nx_i = ix + dx
-            ny_i = iy + dy
-            if nx_i < 0 or nx_i >= nx or ny_i < 0 or ny_i >= ny:
-                continue
-            if occupied[ny_i, nx_i]:
-                continue
-            if dist[ny_i, nx_i] >= 0:
-                continue
-            dist[ny_i, nx_i] = d + 1
-            q.append((nx_i, ny_i))
+        y = y_min + (float(iy) + 0.5) * float(cfg.insertion_grid_resolution)
+        source_world.append(np.array([x_min, y], dtype=np.float32))
 
     source_cells_arr = (
         np.asarray(source_cells, dtype=np.int32)
         if source_cells
         else np.zeros((0, 2), dtype=np.int32)
     )
-    if source_cells:
-        for ix, iy in source_cells:
-            x = x_min + (float(ix) + 0.5) * float(cfg.insertion_grid_resolution)
-            y = y_min + (float(iy) + 0.5) * float(cfg.insertion_grid_resolution)
-            source_world.append(np.array([x, y], dtype=np.float32))
-    source_world_arr = np.asarray(source_world, dtype=np.float32) if source_world else np.zeros((0, 2), dtype=np.float32)
+    source_world_arr = (
+        np.asarray(source_world, dtype=np.float32)
+        if source_world
+        else np.zeros((0, 2), dtype=np.float32)
+    )
 
     return WavefrontGrid(
         x_min=x_min,
@@ -164,47 +137,208 @@ def build_wavefront_grid(scene: SceneState, cfg: SamplingConfig) -> WavefrontGri
         nx=nx,
         ny=ny,
         occupied=occupied,
-        dist=dist,
         source_cells=source_cells_arr,
         source_world_xy=source_world_arr,
         r_eff=r_eff,
+        entry_x=x_min,
     )
 
 
-def _nearest_reachable_cell(
-    grid: WavefrontGrid,
-    p1_xy: np.ndarray,
-    endpoint_tolerance_cells: int,
-) -> tuple[int, int] | None:
-    cell = world_to_cell(grid, p1_xy)
-    if cell is None:
+def _entry_y_interval(grid: WavefrontGrid, p1_xy: np.ndarray, stick_length: float) -> tuple[float, float] | None:
+    p1 = np.asarray(p1_xy, dtype=np.float32).reshape(2)
+    length = float(stick_length)
+    if length <= 0.0:
         return None
-    ix0, iy0 = cell
-    if (not grid.occupied[iy0, ix0]) and int(grid.dist[iy0, ix0]) >= 0:
-        return ix0, iy0
+    dx = float(p1[0] - grid.entry_x)
+    if abs(dx) > length:
+        return None
+    dy_max = np.sqrt(max((length * length) - (dx * dx), 0.0))
+    y_lo = max(float(grid.y_min), float(p1[1] - dy_max))
+    y_hi = min(float(grid.y_max), float(p1[1] + dy_max))
+    if y_lo > y_hi:
+        return None
+    return y_lo, y_hi
 
-    best_cell = None
-    best_sq = float("inf")
-    for r in range(1, int(max(endpoint_tolerance_cells, 0)) + 1):
-        x0 = max(0, ix0 - r)
-        x1 = min(grid.nx - 1, ix0 + r)
-        y0 = max(0, iy0 - r)
-        y1 = min(grid.ny - 1, iy0 + r)
-        for iy in range(y0, y1 + 1):
-            for ix in range(x0, x1 + 1):
-                if grid.occupied[iy, ix]:
-                    continue
-                if int(grid.dist[iy, ix]) < 0:
-                    continue
-                dx = float(ix - ix0)
-                dy = float(iy - iy0)
-                sq = dx * dx + dy * dy
-                if sq < best_sq:
-                    best_sq = sq
-                    best_cell = (ix, iy)
-        if best_cell is not None:
-            return best_cell
-    return None
+
+def _weighted_without_replacement_order(
+    *,
+    source_ys: np.ndarray,
+    center_y: float,
+    decay: float,
+    uniform_mix: float,
+    seed: int,
+) -> np.ndarray:
+    k = int(source_ys.shape[0])
+    if k <= 1:
+        return np.arange(k, dtype=np.int32)
+
+    decay_eff = max(float(decay), 1e-6)
+    mix = float(np.clip(uniform_mix, 0.0, 1.0))
+    d = np.abs(np.asarray(source_ys, dtype=np.float64) - float(center_y))
+    local = np.exp(-d / decay_eff)
+    weights = (mix / float(k)) + (1.0 - mix) * local
+    weights = np.clip(weights, 1e-12, None)
+
+    rng = np.random.default_rng(int(seed))
+    gumbel = rng.gumbel(loc=0.0, scale=1.0, size=k)
+    scores = np.log(weights) + gumbel
+    return np.asarray(np.argsort(scores)[::-1], dtype=np.int32)
+
+
+def _endpoint_terminal_cells(grid: WavefrontGrid, end_xy: np.ndarray) -> set[tuple[int, int]]:
+    p = np.asarray(end_xy, dtype=np.float64).reshape(2)
+    x = float(p[0])
+    y = float(p[1])
+    eps = 1e-9
+    if x < (grid.x_min - eps) or x > (grid.x_max + eps) or y < (grid.y_min - eps) or y > (grid.y_max + eps):
+        return set()
+
+    u = (x - grid.x_min) / grid.resolution
+    v = (y - grid.y_min) / grid.resolution
+    ix_guess = int(np.floor(u))
+    iy_guess = int(np.floor(v))
+    ix_guess = min(max(ix_guess, 0), grid.nx - 1)
+    iy_guess = min(max(iy_guess, 0), grid.ny - 1)
+
+    terminal: set[tuple[int, int]] = set()
+    for iy in range(max(0, iy_guess - 1), min(grid.ny - 1, iy_guess + 1) + 1):
+        y0 = grid.y_min + float(iy) * grid.resolution
+        y1 = y0 + grid.resolution
+        if y < (y0 - eps) or y > (y1 + eps):
+            continue
+        for ix in range(max(0, ix_guess - 1), min(grid.nx - 1, ix_guess + 1) + 1):
+            x0 = grid.x_min + float(ix) * grid.resolution
+            x1 = x0 + grid.resolution
+            if x < (x0 - eps) or x > (x1 + eps):
+                continue
+            terminal.add((ix, iy))
+
+    if not terminal:
+        cell = world_to_cell(grid, p)
+        if cell is not None:
+            terminal.add(cell)
+    return terminal
+
+
+def _segment_cells_supercover(
+    grid: WavefrontGrid,
+    start_xy: np.ndarray,
+    end_xy: np.ndarray,
+) -> list[tuple[int, int]]:
+    a = np.asarray(start_xy, dtype=np.float64).reshape(2)
+    b = np.asarray(end_xy, dtype=np.float64).reshape(2)
+
+    c0 = world_to_cell(grid, a)
+    c1 = world_to_cell(grid, b)
+    if c0 is None or c1 is None:
+        return []
+
+    ix, iy = int(c0[0]), int(c0[1])
+    end_ix, end_iy = int(c1[0]), int(c1[1])
+    cells: list[tuple[int, int]] = [(ix, iy)]
+
+    if (ix, iy) == (end_ix, end_iy):
+        return cells
+
+    dx = float(b[0] - a[0])
+    dy = float(b[1] - a[1])
+    step_x = 1 if dx > 0 else (-1 if dx < 0 else 0)
+    step_y = 1 if dy > 0 else (-1 if dy < 0 else 0)
+
+    def _append(cx: int, cy: int) -> None:
+        if cx < 0 or cx >= grid.nx or cy < 0 or cy >= grid.ny:
+            return
+        if cells and cells[-1] == (cx, cy):
+            return
+        cells.append((cx, cy))
+
+    if step_x != 0:
+        next_x = grid.x_min + float(ix + (1 if step_x > 0 else 0)) * grid.resolution
+        t_max_x = (next_x - float(a[0])) / dx
+        t_delta_x = grid.resolution / abs(dx)
+    else:
+        t_max_x = float("inf")
+        t_delta_x = float("inf")
+
+    if step_y != 0:
+        next_y = grid.y_min + float(iy + (1 if step_y > 0 else 0)) * grid.resolution
+        t_max_y = (next_y - float(a[1])) / dy
+        t_delta_y = grid.resolution / abs(dy)
+    else:
+        t_max_y = float("inf")
+        t_delta_y = float("inf")
+
+    eps = 1e-12
+    while (ix, iy) != (end_ix, end_iy):
+        if t_max_x < (t_max_y - eps):
+            ix += step_x
+            t_max_x += t_delta_x
+            if ix < 0 or ix >= grid.nx:
+                return []
+            _append(ix, iy)
+            continue
+
+        if t_max_y < (t_max_x - eps):
+            iy += step_y
+            t_max_y += t_delta_y
+            if iy < 0 or iy >= grid.ny:
+                return []
+            _append(ix, iy)
+            continue
+
+        # Corner crossing: include both side-adjacent cells and the diagonal.
+        next_ix = ix + step_x
+        next_iy = iy + step_y
+
+        if step_x != 0:
+            _append(next_ix, iy)
+            t_max_x += t_delta_x
+        if step_y != 0:
+            _append(ix, next_iy)
+            t_max_y += t_delta_y
+
+        ix = next_ix if step_x != 0 else ix
+        iy = next_iy if step_y != 0 else iy
+        if ix < 0 or ix >= grid.nx or iy < 0 or iy >= grid.ny:
+            return []
+        _append(ix, iy)
+
+    return cells
+
+
+def line_collision_free_dda_supercover(
+    grid: WavefrontGrid,
+    start_xy: np.ndarray,
+    end_xy: np.ndarray,
+    *,
+    allow_end_occupied: bool = False,
+) -> bool:
+    """Check straight segment against occupied cells via supercover DDA traversal."""
+
+    a = np.asarray(start_xy, dtype=np.float32).reshape(2)
+    b = np.asarray(end_xy, dtype=np.float32).reshape(2)
+
+    if float(np.linalg.norm(b - a)) <= 1e-9:
+        cell = world_to_cell(grid, b)
+        if cell is None:
+            return False
+        ix, iy = cell
+        if grid.occupied[iy, ix] and (not allow_end_occupied):
+            return False
+        return True
+
+    visited = _segment_cells_supercover(grid, a, b)
+    if not visited:
+        return False
+
+    terminal_cells = _endpoint_terminal_cells(grid, b) if allow_end_occupied else set()
+    for ix, iy in visited:
+        if not grid.occupied[iy, ix]:
+            continue
+        if allow_end_occupied and (ix, iy) in terminal_cells:
+            continue
+        return False
+    return True
 
 
 def line_collision_free(
@@ -214,28 +348,14 @@ def line_collision_free(
     *,
     allow_end_occupied: bool = False,
 ) -> bool:
-    """Check straight segment against occupied cells using super-sampling."""
+    """Backward-compatible alias to the DDA supercover line checker."""
 
-    a = np.asarray(start_xy, dtype=np.float32).reshape(2)
-    b = np.asarray(end_xy, dtype=np.float32).reshape(2)
-    length = float(np.linalg.norm(b - a))
-    if length <= 1e-9:
-        return True
-    # Sample denser than cell size so diagonal corner grazes are captured.
-    n_steps = max(int(np.ceil(length / max(0.5 * grid.resolution, 1e-6))), 1)
-    for k in range(n_steps + 1):
-        t = float(k) / float(n_steps)
-        p = (1.0 - t) * a + t * b
-        cell = world_to_cell(grid, p)
-        if cell is None:
-            continue
-        ix, iy = cell
-        if not grid.occupied[iy, ix]:
-            continue
-        if allow_end_occupied and k == n_steps:
-            continue
-        return False
-    return True
+    return line_collision_free_dda_supercover(
+        grid,
+        start_xy,
+        end_xy,
+        allow_end_occupied=allow_end_occupied,
+    )
 
 
 def solve_straight_insertion(
@@ -243,52 +363,54 @@ def solve_straight_insertion(
     scene: SceneState,
     p1_xy: np.ndarray,
     cfg: SamplingConfig,
+    *,
+    deterministic_seed: int | None = None,
 ) -> StraightInsertionPlan | None:
-    """Find a deterministic straight insertion segment from opening to p1."""
+    """Find one straight insertion segment from opening line to p1."""
 
+    del scene
     if grid.source_world_xy.shape[0] == 0:
         return None
 
-    reachable_cell = _nearest_reachable_cell(
-        grid,
-        p1_xy,
-        endpoint_tolerance_cells=int(cfg.insertion_endpoint_tolerance_cells),
+    p1 = np.asarray(p1_xy, dtype=np.float32).reshape(2)
+    if world_to_cell(grid, p1) is None:
+        return None
+
+    interval = _entry_y_interval(grid, p1, float(cfg.insertion_stick_length))
+    if interval is None:
+        return None
+    y_lo, y_hi = interval
+
+    source_ys = np.asarray(grid.source_world_xy[:, 1], dtype=np.float64)
+    candidate_mask = (source_ys >= float(y_lo)) & (source_ys <= float(y_hi))
+    candidate_indices = np.flatnonzero(candidate_mask)
+    if candidate_indices.size == 0:
+        return None
+
+    if deterministic_seed is None:
+        deterministic_seed = 0
+
+    order_local = _weighted_without_replacement_order(
+        source_ys=source_ys[candidate_indices],
+        center_y=float(p1[1]),
+        decay=float(cfg.insertion_entry_weight_decay),
+        uniform_mix=float(cfg.insertion_entry_uniform_mix),
+        seed=int(deterministic_seed),
     )
-    if reachable_cell is None:
-        return None
-    rc_ix, rc_iy = reachable_cell
-    wavefront_dist = int(grid.dist[rc_iy, rc_ix])
 
-    p1_y = float(p1_xy[1])
-    ys = grid.source_world_xy[:, 1]
-    order_full = np.argsort(np.abs(ys - p1_y), kind="stable")
-    max_trials = int(cfg.insertion_max_source_trials)
-    if max_trials > 0:
-        order_primary = order_full[:max_trials]
-        order_fallback = order_full[max_trials:]
-    else:
-        order_primary = order_full
-        order_fallback = np.zeros((0,), dtype=order_full.dtype)
-
-    def _first_collision_free(order: np.ndarray) -> np.ndarray | None:
-        for idx in order:
-            source_xy = grid.source_world_xy[int(idx)]
-            if not line_collision_free(grid, source_xy, p1_xy, allow_end_occupied=True):
-                continue
-            return source_xy
-        return None
-
-    # Fast path: closest-y opening sources first.
-    source_xy = _first_collision_free(order_primary)
-    if source_xy is None and order_fallback.size > 0:
-        # Fallback prevents false negatives when a feasible insertion exists but
-        # lies outside the truncated nearest-y source set.
-        source_xy = _first_collision_free(order_fallback)
-    if source_xy is not None:
+    ordered_indices = candidate_indices[np.asarray(order_local, dtype=np.int32)]
+    sources_total = int(ordered_indices.size)
+    sources_checked = 0
+    for idx in ordered_indices:
+        sources_checked += 1
+        source_xy = grid.source_world_xy[int(idx)]
+        if not line_collision_free_dda_supercover(grid, source_xy, p1, allow_end_occupied=True):
+            continue
         return StraightInsertionPlan(
             source_xy=np.asarray(source_xy, dtype=np.float32),
             approach_backoff=float(cfg.insertion_approach_backoff),
-            wavefront_dist=wavefront_dist,
+            sources_checked=int(sources_checked),
+            sources_total=int(sources_total),
         )
 
     return None

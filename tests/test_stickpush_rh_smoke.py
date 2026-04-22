@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import json
 import numpy as np
 import torch
 
@@ -137,3 +139,18 @@ def test_search_smoke_writes_artifacts(tmp_path):
     assert (latest / "final_plan.json").exists()
     assert (latest / "exp_000001" / "metrics.json").exists()
     assert (latest / "exp_000001" / "selected_only.png").exists()
+    assert (latest / "exp_000001" / "frontier_pre_select.csv").exists()
+    assert (latest / "exp_000001" / "frontier_post_update.csv").exists()
+
+    with (latest / "exp_000001" / "frontier_pre_select.csv").open("r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert rows
+    assert "lex_rank" in rows[0]
+    assert "ucb_score" in rows[0]
+    assert "snapshot_kind" in rows[0]
+    assert any(str(r.get("is_selected", "")).lower() in {"true", "1"} for r in rows)
+    assert all(r.get("snapshot_kind") == "pre_select" for r in rows)
+
+    with (latest / "exp_000001" / "metrics.json").open("r", encoding="utf-8") as f:
+        metrics = json.load(f)
+    assert metrics["selection"]["source"] == "ucb_select"

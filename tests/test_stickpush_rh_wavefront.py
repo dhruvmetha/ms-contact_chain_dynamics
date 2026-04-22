@@ -44,11 +44,12 @@ def test_wavefront_and_feasible_actions_are_cached_for_state_hash():
     cfg = RecedingHorizonConfig(
         sampling=SamplingConfig(
             use_wavefront_insertion_solver=True,
-            insertion_grid_resolution=0.003,
-            insertion_grid_safety_eps=0.0,
-            x_approach_values=(0.07,),
-            insertion_approach_backoff=0.07,
-            include_target_pushes=False,
+                insertion_grid_resolution=0.003,
+                insertion_grid_safety_eps=0.0,
+                insertion_stick_length=0.50,
+                x_approach_values=(0.07,),
+                insertion_approach_backoff=0.07,
+                include_target_pushes=False,
             heading_degrees=(0, 45, 90, 135, 180, 225, 270, 315),
             delta_len_fracs=(0.3, 0.6, 0.9),
         )

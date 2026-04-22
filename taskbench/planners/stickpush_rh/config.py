@@ -51,8 +51,9 @@ class SamplingConfig:
     use_wavefront_insertion_solver: bool = True
     insertion_grid_resolution: float = 0.003
     insertion_grid_safety_eps: float = 0.0
-    insertion_endpoint_tolerance_cells: int = 2
-    insertion_max_source_trials: int = 64
+    insertion_stick_length: float = 0.25
+    insertion_entry_weight_decay: float = 0.04
+    insertion_entry_uniform_mix: float = 0.15
 
 
 @dataclass

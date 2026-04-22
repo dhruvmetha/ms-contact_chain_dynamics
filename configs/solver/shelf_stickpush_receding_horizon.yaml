@@ -31,8 +31,9 @@ run:
     use_wavefront_insertion_solver: true
     insertion_grid_resolution: 0.003
     insertion_grid_safety_eps: 0.0
-    insertion_endpoint_tolerance_cells: 2
-    insertion_max_source_trials: 64
+    insertion_stick_length: 0.25
+    insertion_entry_weight_decay: 0.04
+    insertion_entry_uniform_mix: 0.15
     max_target_shift_xy: 0.02
     target_wall_margin: 0.01
     prune_target_invalid_nodes: false

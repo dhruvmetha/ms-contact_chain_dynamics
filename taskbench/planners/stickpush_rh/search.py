@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import hashlib
 import time
 
 import numpy as np
@@ -158,26 +159,46 @@ class StickPushRecedingHorizonSearch:
         metrics_rev.reverse()
         return actions_rev, metrics_rev, node_ids
 
-    def _frontier_rows(self, nodes: dict[int, SearchNode]) -> list[dict]:
-        total_visits = max(1, sum(max(1, n.visits) for n in nodes.values()))
-        rows = []
-        for node_id, node in nodes.items():
-            if not node.untried_actions:
-                continue
-            rows.append(
-                {
-                    "node_id": node_id,
-                    "parent_id": node.parent_id,
-                    "depth": node.depth,
-                    "visits": node.visits,
-                    "reward_sum": node.reward_sum,
-                    "ucb_score": self.ucb.score(node, total_visits),
-                    "n_untried": len(node.untried_actions),
-                    "state_hash": node.state_hash,
-                    **serialize_metrics(node.metrics),
-                }
-            )
-        rows.sort(key=lambda row: row["ucb_score"], reverse=True)
+    def _frontier_rows(
+        self,
+        nodes: dict[int, SearchNode],
+        candidate_ids: list[int] | None = None,
+        *,
+        selected_node_id: int | None = None,
+        selection_id: int | None = None,
+        selection_source: str | None = None,
+        snapshot_kind: str = "post_update",
+    ) -> list[dict]:
+        ids = list(candidate_ids) if candidate_ids is not None else self._expandable_node_ids(nodes)
+        ranked_rows = self.ucb.ranked_candidates(nodes, ids)
+        rows: list[dict] = []
+        for ranked in ranked_rows:
+            node_id = int(ranked["node_id"])
+            node = nodes[node_id]
+            row = {
+                "node_id": node_id,
+                "parent_id": node.parent_id,
+                "depth": node.depth,
+                "visits": node.visits,
+                "reward_sum": node.reward_sum,
+                "lex_rank": int(ranked["lex_rank"]),
+                "rank_order": int(ranked.get("rank_order", 0)),
+                "total_visits": int(ranked.get("total_visits", 0)),
+                "ucb_score": float(ranked["ucb_score"]),
+                "ucb_lex_score": float(ranked["lex_score"]),
+                "ucb_explore_bonus": float(ranked["explore_bonus"]),
+                "ucb_untried_bonus": float(ranked["untried_bonus"]),
+                "n_untried": len(node.untried_actions),
+                "state_hash": node.state_hash,
+                "is_selected": bool(selected_node_id is not None and node_id == int(selected_node_id)),
+                "snapshot_kind": str(snapshot_kind),
+                **serialize_metrics(node.metrics),
+            }
+            if selection_id is not None:
+                row["selection_id"] = int(selection_id)
+            if selection_source is not None:
+                row["selection_source"] = str(selection_source)
+            rows.append(row)
         return rows
 
     def _best_node_id(self, nodes: dict[int, SearchNode]) -> int:
@@ -248,6 +269,22 @@ class StickPushRecedingHorizonSearch:
             retract_xyz=np.asarray(action.retract_xyz, dtype=np.float32).copy(),
             meta=dict(action.meta),
         )
+
+    @staticmethod
+    def _insertion_deterministic_seed(
+        *,
+        state_hash: str,
+        action: PlannerAction,
+    ) -> int:
+        entry = np.asarray(action.entry_xyz, dtype=np.float64)
+        sweep = np.asarray(action.sweep_xyz, dtype=np.float64)
+        payload = (
+            f"{state_hash}|{action.blocker_name}|{float(action.theta_deg):.6f}|"
+            f"{int(action.delta_len_idx)}|{float(action.push_len):.6f}|"
+            f"{float(entry[0]):.6f}|{float(entry[1]):.6f}|"
+            f"{float(sweep[0]):.6f}|{float(sweep[1]):.6f}"
+        ).encode("utf-8")
+        return int.from_bytes(hashlib.sha1(payload).digest()[:8], "little", signed=False)
 
     @staticmethod
     def _capture_rgb_frame_from_env_index(env, env_index: int) -> np.ndarray:
@@ -378,6 +415,10 @@ class StickPushRecedingHorizonSearch:
                 scene,
                 action.entry_xyz[:2],
                 self.cfg.sampling,
+                deterministic_seed=self._insertion_deterministic_seed(
+                    state_hash=state_hash,
+                    action=action,
+                ),
             )
             insertion_solver_only_ms += _elapsed_ms(t_solver_ns)
             if plan is None:
@@ -401,10 +442,11 @@ class StickPushRecedingHorizonSearch:
                 continue
 
             meta = dict(action.meta)
-            meta["insertion_wavefront_dist"] = int(plan.wavefront_dist)
             meta["insertion_source_xy"] = np.asarray(plan.source_xy, dtype=np.float32).tolist()
             meta["insertion_backoff"] = float(plan.approach_backoff)
-            meta["insertion_solver"] = "wavefront_straight_los"
+            meta["insertion_sources_checked"] = int(plan.sources_checked)
+            meta["insertion_sources_total"] = int(plan.sources_total)
+            meta["insertion_solver"] = "entry_interval_weighted_dda_supercover"
 
             feasible_actions.append(
                 PlannerAction(
@@ -569,6 +611,7 @@ class StickPushRecedingHorizonSearch:
         parallel_frontier_enabled = bool(self.cfg.parallel_frontier_enabled)
         parallel_frontier_batch_size = max(1, int(self.cfg.parallel_frontier_batch_size))
         pending_exec_queue: list[dict] = []
+        frontier_selection_id = 0
 
         t_root_artifact_io_ns = time.perf_counter_ns()
         save_image(artifacts / "root_before.png", capture_rgb_frame(self.env))
@@ -604,6 +647,10 @@ class StickPushRecedingHorizonSearch:
             if (not candidate_ids) and (not pending_exec_queue):
                 break
             frontier_candidate_count = int(len(candidate_ids))
+            selection_id: int | None = None
+            selected_node_id_for_selection: int | None = None
+            selection_source = "queued_batch_lane"
+            frontier_pre_rows: list[dict] = []
             if pending_exec_queue:
                 queued = pending_exec_queue.pop(0)
                 node_id = int(queued["node_id"])
@@ -614,15 +661,33 @@ class StickPushRecedingHorizonSearch:
                 before_frame = queued["before_frame"]
                 prep_ms = 0.0
                 frontier_select_ms = 0.0
+                selection_source = str(queued.get("selection_source", "queued_batch_lane"))
+                queued_selection_id = queued.get("selection_id")
+                if queued_selection_id is not None:
+                    selection_id = int(queued_selection_id)
+                selected_node_id_for_selection = int(queued.get("selected_node_id", node_id))
+                frontier_pre_rows = [dict(row) for row in queued.get("frontier_pre_rows", [])]
                 child_state_override = queued.get("child_state")
                 if child_state_override is not None:
                     self.raw.set_state(child_state_override.clone())
                 exec_ms = float(queued.get("exec_ms", 0.0))
             else:
+                selection_source = "ucb_select"
+                frontier_selection_id += 1
+                selection_id = int(frontier_selection_id)
                 t_frontier_select_ns = time.perf_counter_ns()
                 node_id = self.ucb.select(nodes, candidate_ids)
                 frontier_select_ms = _elapsed_ms(t_frontier_select_ns)
                 node = nodes[node_id]
+                selected_node_id_for_selection = int(node_id)
+                frontier_pre_rows = self._frontier_rows(
+                    nodes,
+                    candidate_ids,
+                    selected_node_id=node_id,
+                    selection_id=selection_id,
+                    selection_source=selection_source,
+                    snapshot_kind="pre_select",
+                )
 
                 self.raw.set_state(node.sim_state.clone())
                 scene_before = self.state_provider.get_scene_state(self.env)
@@ -666,6 +731,10 @@ class StickPushRecedingHorizonSearch:
                                 "scene_before": scene_before,
                                 "before_frame": before_frame,
                                 "exec_ms": float(exec_per_action_ms),
+                                "selection_id": selection_id,
+                                "selection_source": "queued_batch_lane",
+                                "selected_node_id": selected_node_id_for_selection,
+                                "frontier_pre_rows": [dict(row) for row in frontier_pre_rows],
                             }
                             for i in range(1, len(batch_outputs))
                         ]
@@ -763,13 +832,28 @@ class StickPushRecedingHorizonSearch:
                         },
                         "rejected": True,
                         "rejected_reason": reject_reason,
+                        "selection": {
+                            "id": selection_id,
+                            "source": selection_source,
+                            "selected_node_id": selected_node_id_for_selection,
+                            "expandable_candidate_count": frontier_candidate_count,
+                        },
                     },
                 )
                 if self.cfg.visual.save_frontier_csv:
+                    frontier_post_rows = self._frontier_rows(
+                        nodes,
+                        self._expandable_node_ids(nodes),
+                        selection_id=selection_id,
+                        selection_source=selection_source,
+                        snapshot_kind="post_update",
+                    )
                     write_frontier_csv(
                         exp_dir / "frontier.csv",
-                        self._frontier_rows(nodes),
+                        frontier_post_rows,
                     )
+                    write_frontier_csv(exp_dir / "frontier_post_update.csv", frontier_post_rows)
+                    write_frontier_csv(exp_dir / "frontier_pre_select.csv", frontier_pre_rows)
                 artifact_io_ms = _elapsed_ms(t_artifact_io_ns)
                 total_ms = _elapsed_ms(t_expansion_ns)
                 timing_ms = {
@@ -968,13 +1052,28 @@ class StickPushRecedingHorizonSearch:
                     },
                     "goal_checks": child_goal_diag,
                     "action_generation": child_action_diag,
+                    "selection": {
+                        "id": selection_id,
+                        "source": selection_source,
+                        "selected_node_id": selected_node_id_for_selection,
+                        "expandable_candidate_count": frontier_candidate_count,
+                    },
                 },
             )
             if self.cfg.visual.save_frontier_csv:
+                frontier_post_rows = self._frontier_rows(
+                    nodes,
+                    self._expandable_node_ids(nodes),
+                    selection_id=selection_id,
+                    selection_source=selection_source,
+                    snapshot_kind="post_update",
+                )
                 write_frontier_csv(
                     exp_dir / "frontier.csv",
-                    self._frontier_rows(nodes),
+                    frontier_post_rows,
                 )
+                write_frontier_csv(exp_dir / "frontier_post_update.csv", frontier_post_rows)
+                write_frontier_csv(exp_dir / "frontier_pre_select.csv", frontier_pre_rows)
             artifact_io_ms = _elapsed_ms(t_artifact_io_ns)
             total_ms = _elapsed_ms(t_expansion_ns)
             timing_ms = {

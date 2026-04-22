@@ -62,8 +62,9 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         use_wavefront_insertion_solver: bool = True,
         insertion_grid_resolution: float = 0.003,
         insertion_grid_safety_eps: float = 0.0,
-        insertion_endpoint_tolerance_cells: int = 2,
-        insertion_max_source_trials: int = 64,
+        insertion_stick_length: float = 0.25,
+        insertion_entry_weight_decay: float = 0.04,
+        insertion_entry_uniform_mix: float = 0.15,
         max_target_shift_xy: float = 0.02,
         target_wall_margin: float = 0.01,
         prune_target_invalid_nodes: bool = False,
@@ -120,8 +121,9 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         self.use_wavefront_insertion_solver = bool(use_wavefront_insertion_solver)
         self.insertion_grid_resolution = float(insertion_grid_resolution)
         self.insertion_grid_safety_eps = float(insertion_grid_safety_eps)
-        self.insertion_endpoint_tolerance_cells = int(insertion_endpoint_tolerance_cells)
-        self.insertion_max_source_trials = int(insertion_max_source_trials)
+        self.insertion_stick_length = float(insertion_stick_length)
+        self.insertion_entry_weight_decay = float(insertion_entry_weight_decay)
+        self.insertion_entry_uniform_mix = float(insertion_entry_uniform_mix)
         self.max_target_shift_xy = float(max_target_shift_xy)
         self.target_wall_margin = float(target_wall_margin)
         self.prune_target_invalid_nodes = bool(prune_target_invalid_nodes)
@@ -177,8 +179,9 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
             use_wavefront_insertion_solver=self.use_wavefront_insertion_solver,
             insertion_grid_resolution=self.insertion_grid_resolution,
             insertion_grid_safety_eps=self.insertion_grid_safety_eps,
-            insertion_endpoint_tolerance_cells=self.insertion_endpoint_tolerance_cells,
-            insertion_max_source_trials=self.insertion_max_source_trials,
+            insertion_stick_length=self.insertion_stick_length,
+            insertion_entry_weight_decay=self.insertion_entry_weight_decay,
+            insertion_entry_uniform_mix=self.insertion_entry_uniform_mix,
             min_push_len=self.min_push_len,
             min_insertion_depth=self.min_insertion_depth,
         )
