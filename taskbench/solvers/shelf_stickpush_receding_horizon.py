@@ -72,6 +72,7 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         visual_save_images: bool = True,
         visual_save_frontier_csv: bool = True,
         visual_replay_stride: int = 2,
+        diagnostics_timing_enabled: bool = False,
         entry_max_steps: int = 200,
         sweep_max_steps: int = 200,
         retract_max_steps: int = 100,
@@ -127,6 +128,7 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         self.visual_save_images = bool(visual_save_images)
         self.visual_save_frontier_csv = bool(visual_save_frontier_csv)
         self.visual_replay_stride = int(visual_replay_stride)
+        self.diagnostics_timing_enabled = bool(diagnostics_timing_enabled)
         self.entry_max_steps = int(entry_max_steps)
         self.sweep_max_steps = int(sweep_max_steps)
         self.retract_max_steps = int(retract_max_steps)
@@ -185,6 +187,7 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
             save_frontier_csv=self.visual_save_frontier_csv,
             replay_stride=self.visual_replay_stride,
             max_candidates_drawn=self.visual_max_candidates_drawn,
+            save_timing_diagnostics=self.diagnostics_timing_enabled,
         )
         return RecedingHorizonConfig(
             max_executions=self.max_executions,
@@ -250,6 +253,7 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
             push_skill,
             approach_quaternion_wxyz=Q_INTO_SHELF,
             cuda_device=cuda_device,
+            timing_enabled=self.diagnostics_timing_enabled,
             entry_max_steps=self.entry_max_steps,
             sweep_max_steps=self.sweep_max_steps,
             retract_max_steps=self.retract_max_steps,

@@ -14,8 +14,9 @@ Usage:
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Callable
+import time
 
 import torch
 
@@ -39,6 +40,8 @@ class StickPushResult:
     retract_final_dist: torch.Tensor # (N,) float — distance to retract point
     orientation_drift: torch.Tensor  # (N,) float — max quat deviation from goal
     steps_executed: int              # total sim steps
+    phase_steps: dict[str, int] = field(default_factory=dict)
+    phase_timing_ms: dict[str, float] = field(default_factory=dict)
 
 
 class StickPush:
@@ -128,7 +131,12 @@ class StickPush:
             StickPushResult with per-env telemetry.
         """
         total_steps = 0
+        phase_steps: dict[str, int] = {}
+        phase_timing_ms: dict[str, float] = {}
         eef_trace = []  # track TCP position every step
+
+        def _ms_since(start_ns: int) -> float:
+            return float(time.perf_counter_ns() - int(start_ns)) / 1e6
 
         def _record_eef():
             tcp = self.raw.agent.tcp.pose.p[0].cpu().numpy().copy()
@@ -150,13 +158,18 @@ class StickPush:
                         label, *tcp, *quat, drift.mean().item())
 
         # --- Phase 1: Stage (cuRobo, pd_joint_pos) ---
-        staging_success, staging_steps = self._stage(
+        t_stage_ns = time.perf_counter_ns()
+        staging_success, staging_steps, stage_plan_ms, stage_execute_ms = self._stage(
             approach_positions, approach_quaternions,
             max_attempts=staging_max_attempts,
             timeout=staging_timeout,
             step_callback=_tracking_callback,
         )
         total_steps += staging_steps
+        phase_steps["stage"] = int(staging_steps)
+        phase_timing_ms["stage_total"] = _ms_since(t_stage_ns)
+        phase_timing_ms["stage_plan"] = float(stage_plan_ms)
+        phase_timing_ms["stage_execute"] = float(stage_execute_ms)
         _log_orientation("After stage")
 
         # If stage failed for any env, do not drive that env through insert/sweep/retract.
@@ -176,6 +189,7 @@ class StickPush:
         self.raw.agent.controller.reset()
         _log_orientation("After mode switch (before insert)")
 
+        t_entry_ns = time.perf_counter_ns()
         entry_result = batched_ee_delta_move(
             self.env, entry_positions_eff,
             target_quaternions=approach_quaternions,
@@ -183,6 +197,8 @@ class StickPush:
             convergence_threshold=convergence_threshold,
             step_callback=_tracking_callback,
         )
+        phase_timing_ms["entry_move"] = _ms_since(t_entry_ns)
+        phase_steps["entry"] = int(entry_result["steps_executed"])
         total_steps += entry_result["steps_executed"]
         logger.info("  Insert: %d steps, mean_dist=%.4f, converged=%d/%d",
                      entry_result["steps_executed"],
@@ -191,6 +207,7 @@ class StickPush:
         _log_orientation("After insert")
 
         # --- Phase 3: Sweep (pd_ee_delta_pose) ---
+        t_sweep_ns = time.perf_counter_ns()
         sweep_result = batched_ee_delta_move(
             self.env, sweep_positions_eff,
             target_quaternions=approach_quaternions,
@@ -198,6 +215,8 @@ class StickPush:
             convergence_threshold=convergence_threshold,
             step_callback=_tracking_callback,
         )
+        phase_timing_ms["sweep_move"] = _ms_since(t_sweep_ns)
+        phase_steps["sweep"] = int(sweep_result["steps_executed"])
         total_steps += sweep_result["steps_executed"]
         logger.info("  Sweep: %d steps, mean_dist=%.4f, converged=%d/%d",
                      sweep_result["steps_executed"],
@@ -213,20 +232,24 @@ class StickPush:
         sweep_unit = sweep_dir / sweep_len
         nudge_back = tcp_now - sweep_unit * 0.03  # 3cm back along sweep direction
         nudge_back[:, 2] = tcp_now[:, 2]  # keep same z
-        batched_ee_delta_move(
+        t_retract_nudge_ns = time.perf_counter_ns()
+        nudge_result = batched_ee_delta_move(
             self.env, nudge_back,
             target_quaternions=approach_quaternions,
             max_steps=20, max_delta=max_delta,
             convergence_threshold=convergence_threshold,
             step_callback=_tracking_callback,
         )
-        total_steps += 20
+        phase_timing_ms["retract_nudge"] = _ms_since(t_retract_nudge_ns)
+        phase_steps["retract_nudge"] = int(nudge_result["steps_executed"])
+        total_steps += int(nudge_result["steps_executed"])
 
         # 4b: Pull straight out from current position (just change X)
         tcp_after_nudge = self.raw.agent.tcp.pose.p.clone()
         retract_from_here = tcp_after_nudge.clone()
         retract_from_here[:, 0] = retract_positions_eff.to(self.device)[:, 0]  # pull X to outside shelf
         retract_from_here[:, 2] = retract_positions_eff.to(self.device)[:, 2]  # keep target Z
+        t_retract_pull_ns = time.perf_counter_ns()
         retract_result = batched_ee_delta_move(
             self.env, retract_from_here,
             target_quaternions=approach_quaternions,
@@ -234,6 +257,8 @@ class StickPush:
             convergence_threshold=convergence_threshold,
             step_callback=_tracking_callback,
         )
+        phase_timing_ms["retract_pull"] = _ms_since(t_retract_pull_ns)
+        phase_steps["retract_pull"] = int(retract_result["steps_executed"])
         total_steps += retract_result["steps_executed"]
         logger.info("  Retract: %d steps, mean_dist=%.4f, converged=%d/%d",
                      retract_result["steps_executed"],
@@ -248,12 +273,31 @@ class StickPush:
         orientation_drift = 1.0 - torch.clamp(dots, max=1.0)
 
         # --- Phase 5: Return to rest (EE pullback + joint interpolation) ---
-        self._return_to_rest(
+        t_return_ns = time.perf_counter_ns()
+        return_details = self._return_to_rest(
             approach_quaternions=approach_quaternions,
             step_callback=_tracking_callback,
         )
+        phase_timing_ms["return_to_rest"] = _ms_since(t_return_ns)
+        phase_steps["return_pullback"] = int(return_details.get("pullback_steps", 0))
+        phase_steps["return_joint_interp"] = int(return_details.get("joint_interp_steps", 0))
+        phase_steps["return_total"] = int(return_details.get("total_steps", 0))
         total_steps += rest_steps  # approximate
+        phase_steps["rest_steps_accounted"] = int(rest_steps)
         logger.info("  Rest: orient_drift=%.4f", orientation_drift.mean().item())
+
+        phase_timing_ms["motion_total_excluding_stage_plan"] = float(
+            phase_timing_ms.get("stage_execute", 0.0)
+            + phase_timing_ms.get("entry_move", 0.0)
+            + phase_timing_ms.get("sweep_move", 0.0)
+            + phase_timing_ms.get("retract_nudge", 0.0)
+            + phase_timing_ms.get("retract_pull", 0.0)
+            + phase_timing_ms.get("return_to_rest", 0.0)
+        )
+        phase_timing_ms["motion_total_including_stage_plan"] = float(
+            phase_timing_ms.get("motion_total_excluding_stage_plan", 0.0)
+            + phase_timing_ms.get("stage_plan", 0.0)
+        )
 
         # Dump EEF trace summary
         import numpy as np
@@ -280,6 +324,8 @@ class StickPush:
             retract_final_dist=retract_result["final_dists"],
             orientation_drift=orientation_drift,
             steps_executed=total_steps,
+            phase_steps=phase_steps,
+            phase_timing_ms=phase_timing_ms,
         )
 
     def _stage(
@@ -290,10 +336,11 @@ class StickPush:
         max_attempts: int = 10,
         timeout: float = 30.0,
         step_callback: Optional[Callable] = None,
-    ) -> tuple[torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, int, float, float]:
         """Plan and execute staging: rest → approach point via cuRobo.
 
-        Returns (staging_success (N,) bool, steps_executed int).
+        Returns:
+            (staging_success (N,) bool, steps_executed int, plan_time_ms, execute_time_ms).
         """
         from curobo.types.math import Pose as CuPose
         from curobo.types.robot import JointState as CuJointState
@@ -329,17 +376,19 @@ class StickPush:
         )
 
         # Plan
+        t_plan_ns = time.perf_counter_ns()
         if N == 1:
             result = self.motion_gen.plan_single(start_state, goal_pose, plan_config)
         else:
             result = self.motion_gen.plan_batch(start_state, goal_pose, plan_config)
+        stage_plan_ms = float(time.perf_counter_ns() - int(t_plan_ns)) / 1e6
 
         staging_success = result.success.cpu().to(dtype=torch.bool)
         n_ok = staging_success.sum().item()
         logger.info("  Stage: %d/%d planned", n_ok, N)
 
         if n_ok == 0:
-            return staging_success.to(self.device), 0
+            return staging_success.to(self.device), 0, stage_plan_ms, 0.0
 
         # Extract trajectories
         trajectories = result.optimized_plan.position  # (N, T, n_arm) or (T, n_arm)
@@ -353,6 +402,7 @@ class StickPush:
                 trajectories[i] = start_pos[i].unsqueeze(0).expand(T, -1)
 
         # Execute via pd_joint_pos
+        t_execute_ns = time.perf_counter_ns()
         traj_dev = trajectories.to(device=self.device, dtype=torch.float32)
         for t in range(T):
             self.env.step(traj_dev[:, t, :])
@@ -366,9 +416,10 @@ class StickPush:
             if step_callback is not None:
                 step_callback(0, None, None)
 
-        return staging_success.to(self.device), T + settle
+        stage_execute_ms = float(time.perf_counter_ns() - int(t_execute_ns)) / 1e6
+        return staging_success.to(self.device), T + settle, stage_plan_ms, stage_execute_ms
 
-    def _return_to_rest(self, *, approach_quaternions=None, step_callback=None):
+    def _return_to_rest(self, *, approach_quaternions=None, step_callback=None) -> dict:
         """Pull stick straight back via EE control, then smooth joint interpolation to rest.
 
         Two phases:
@@ -384,7 +435,7 @@ class StickPush:
         tcp = self.raw.agent.tcp.pose.p.clone()
         pullback_target = tcp.clone()
         pullback_target[:, 0] = self.robot_base_pos[0, 0].item() + 0.10  # just in front of robot base
-        batched_ee_delta_move(
+        pullback_result = batched_ee_delta_move(
             self.env, pullback_target,
             target_quaternions=approach_quaternions,
             max_steps=80, max_delta=0.03,
@@ -408,3 +459,10 @@ class StickPush:
             if step_callback is not None:
                 step_callback(0, None, None)
         logger.info("  Rest interpolation: 40 steps")
+        pullback_steps = int(pullback_result.get("steps_executed", 0))
+        joint_interp_steps = 40
+        return {
+            "pullback_steps": pullback_steps,
+            "joint_interp_steps": joint_interp_steps,
+            "total_steps": int(pullback_steps + joint_interp_steps),
+        }

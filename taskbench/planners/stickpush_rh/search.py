@@ -117,6 +117,7 @@ class StickPushRecedingHorizonSearch:
         self.state_provider = state_provider or GTSceneStateProvider(env_index=0)
         self.sampler = sampler or StickPushSampler(cfg.sampling)
         self.ucb = ucb or FrontierUCB(cfg.ucb)
+        self.timing_enabled = bool(self.cfg.visual.save_timing_diagnostics)
         self._wavefront_cache: dict[str, WavefrontGrid] = {}
         self._feasible_action_cache: dict[str, list[PlannerAction]] = {}
         self._action_diag_cache: dict[str, dict] = {}
@@ -253,6 +254,7 @@ class StickPushRecedingHorizonSearch:
         state_hash: str,
         rng: np.random.Generator,
     ) -> tuple[list[PlannerAction], dict]:
+        timing_enabled = bool(self.timing_enabled)
         t_total_ns = time.perf_counter_ns()
 
         if not self.cfg.sampling.use_wavefront_insertion_solver:
@@ -281,6 +283,8 @@ class StickPushRecedingHorizonSearch:
                     "shuffle": shuffle_ms,
                 },
             }
+            if not timing_enabled:
+                diagnostics.pop("timing_ms", None)
             return shuffled, diagnostics
 
         if state_hash in self._feasible_action_cache:
@@ -309,6 +313,8 @@ class StickPushRecedingHorizonSearch:
                     "shuffle": shuffle_ms,
                 },
             }
+            if not timing_enabled:
+                diagnostics.pop("timing_ms", None)
             return shuffled, diagnostics
 
         t_sampling_ns = time.perf_counter_ns()
@@ -412,6 +418,8 @@ class StickPushRecedingHorizonSearch:
         shuffle_ms = _elapsed_ms(t_shuffle_ns)
         diagnostics["timing_ms"]["shuffle"] = shuffle_ms
         diagnostics["timing_ms"]["total"] = _elapsed_ms(t_total_ns)
+        if not timing_enabled:
+            diagnostics.pop("timing_ms", None)
         return shuffled, diagnostics
 
     def run(self, seed: int | None = None) -> PlannerRunResult:
@@ -419,6 +427,7 @@ class StickPushRecedingHorizonSearch:
         rng = np.random.default_rng(seed)
         artifacts = build_artifact_dir(self.cfg.artifact_root, seed)
         root_state = self.raw.get_state().clone()
+        timing_enabled = bool(self.timing_enabled)
 
         action_gen_rows: list[dict] = []
         expansion_timing_rows: list[dict] = []
@@ -768,7 +777,9 @@ class StickPushRecedingHorizonSearch:
                 "rejected_infeasible_insertion": 0,
                 "num_insertion_checks": 0,
                 "num_insertion_solved": 0,
-                "timing_ms": {
+            }
+            if timing_enabled:
+                child_action_diag["timing_ms"] = {
                     "total": 0.0,
                     "sampling": 0.0,
                     "wavefront_build": 0.0,
@@ -776,8 +787,7 @@ class StickPushRecedingHorizonSearch:
                     "insertion_solver_only": 0.0,
                     "cache_clone": 0.0,
                     "shuffle": 0.0,
-                },
-            }
+                }
             child_actions_built = False
             if not child_metrics.solved and child_depth < self.cfg.max_depth:
                 if (not self.cfg.prune_target_invalid_nodes) or child_goal_diag["target_shift_ok"]:
@@ -981,60 +991,62 @@ class StickPushRecedingHorizonSearch:
         save_video(artifacts / "final_replay.mp4", replay_frames, fps=20)
         replay_video_ms = _elapsed_ms(t_replay_ns)
 
-        timing_summary = {
-            "run_total_ms": _elapsed_ms(t_run_ns),
-            "search_loop_ms": search_loop_ms,
-            "root_artifact_io_ms": root_artifact_io_ms,
-            "replay_video_ms": replay_video_ms,
-            "action_generation_calls": int(len(action_gen_rows)),
-            "action_generation_action_cache_hits": int(action_gen_cache_hits),
-            "action_generation_wavefront_cache_hits": int(action_gen_wavefront_cache_hits),
-            "action_generation_ms": {
-                "total": _stats_ms(action_gen_total_ms),
-                "sampling": _stats_ms(action_gen_sampling_ms),
-                "wavefront_build": _stats_ms(action_gen_wavefront_build_ms),
-                "insertion_filter": _stats_ms(action_gen_insertion_filter_ms),
-                "insertion_solver_only": _stats_ms(action_gen_insertion_solver_ms),
-                "cache_clone": _stats_ms(action_gen_cache_clone_ms),
-                "shuffle": _stats_ms(action_gen_shuffle_ms),
-            },
-            "expansion_ms": {
-                "total": _stats_ms(expansion_total_ms_values),
-                "frontier_expandable_scan": _stats_ms(frontier_expandable_scan_ms_values),
-                "frontier_select": _stats_ms(frontier_select_ms_values),
-                "frontier_candidate_count": _stats_scalar(frontier_candidate_count_values),
-                "prep": _stats_ms(expansion_prep_ms_values),
-                "execute": _stats_ms(execution_ms_values),
-                "execute_internal_total": _stats_ms(execution_internal_total_ms_values),
-                "child_eval": _stats_ms(expansion_child_eval_ms_values),
-                "child_action_generation": _stats_ms(expansion_child_action_gen_ms_values),
-                "artifact_io": _stats_ms(expansion_artifact_io_ms_values),
-            },
-            "execution_phase_ms": {
-                "stage_plan": _stats_ms(execution_phase_stage_plan_ms_values),
-                "stage_execute": _stats_ms(execution_phase_stage_execute_ms_values),
-                "entry_move": _stats_ms(execution_phase_entry_ms_values),
-                "sweep_move": _stats_ms(execution_phase_sweep_ms_values),
-                "retract_nudge": _stats_ms(execution_phase_retract_nudge_ms_values),
-                "retract_pull": _stats_ms(execution_phase_retract_pull_ms_values),
-                "return_to_rest": _stats_ms(execution_phase_return_to_rest_ms_values),
-                "motion_total_excluding_stage_plan": _stats_ms(
-                    execution_phase_motion_total_excl_plan_ms_values
-                ),
-                "motion_total_including_stage_plan": _stats_ms(
-                    execution_phase_motion_total_incl_plan_ms_values
-                ),
-            },
-            "reject_reason_counts": reject_reason_counts,
-        }
-        save_json(
-            artifacts / "timing_diagnostics.json",
-            {
-                "timing_summary": timing_summary,
-                "action_generation": action_gen_rows,
-                "expansions": expansion_timing_rows,
-            },
-        )
+        timing_summary: dict | None = None
+        if timing_enabled:
+            timing_summary = {
+                "run_total_ms": _elapsed_ms(t_run_ns),
+                "search_loop_ms": search_loop_ms,
+                "root_artifact_io_ms": root_artifact_io_ms,
+                "replay_video_ms": replay_video_ms,
+                "action_generation_calls": int(len(action_gen_rows)),
+                "action_generation_action_cache_hits": int(action_gen_cache_hits),
+                "action_generation_wavefront_cache_hits": int(action_gen_wavefront_cache_hits),
+                "action_generation_ms": {
+                    "total": _stats_ms(action_gen_total_ms),
+                    "sampling": _stats_ms(action_gen_sampling_ms),
+                    "wavefront_build": _stats_ms(action_gen_wavefront_build_ms),
+                    "insertion_filter": _stats_ms(action_gen_insertion_filter_ms),
+                    "insertion_solver_only": _stats_ms(action_gen_insertion_solver_ms),
+                    "cache_clone": _stats_ms(action_gen_cache_clone_ms),
+                    "shuffle": _stats_ms(action_gen_shuffle_ms),
+                },
+                "expansion_ms": {
+                    "total": _stats_ms(expansion_total_ms_values),
+                    "frontier_expandable_scan": _stats_ms(frontier_expandable_scan_ms_values),
+                    "frontier_select": _stats_ms(frontier_select_ms_values),
+                    "frontier_candidate_count": _stats_scalar(frontier_candidate_count_values),
+                    "prep": _stats_ms(expansion_prep_ms_values),
+                    "execute": _stats_ms(execution_ms_values),
+                    "execute_internal_total": _stats_ms(execution_internal_total_ms_values),
+                    "child_eval": _stats_ms(expansion_child_eval_ms_values),
+                    "child_action_generation": _stats_ms(expansion_child_action_gen_ms_values),
+                    "artifact_io": _stats_ms(expansion_artifact_io_ms_values),
+                },
+                "execution_phase_ms": {
+                    "stage_plan": _stats_ms(execution_phase_stage_plan_ms_values),
+                    "stage_execute": _stats_ms(execution_phase_stage_execute_ms_values),
+                    "entry_move": _stats_ms(execution_phase_entry_ms_values),
+                    "sweep_move": _stats_ms(execution_phase_sweep_ms_values),
+                    "retract_nudge": _stats_ms(execution_phase_retract_nudge_ms_values),
+                    "retract_pull": _stats_ms(execution_phase_retract_pull_ms_values),
+                    "return_to_rest": _stats_ms(execution_phase_return_to_rest_ms_values),
+                    "motion_total_excluding_stage_plan": _stats_ms(
+                        execution_phase_motion_total_excl_plan_ms_values
+                    ),
+                    "motion_total_including_stage_plan": _stats_ms(
+                        execution_phase_motion_total_incl_plan_ms_values
+                    ),
+                },
+                "reject_reason_counts": reject_reason_counts,
+            }
+            save_json(
+                artifacts / "timing_diagnostics.json",
+                {
+                    "timing_summary": timing_summary,
+                    "action_generation": action_gen_rows,
+                    "expansions": expansion_timing_rows,
+                },
+            )
 
         save_json(
             artifacts / "final_plan.json",
@@ -1058,8 +1070,9 @@ class StickPushRecedingHorizonSearch:
             "artifact_dir": str(artifacts),
             "root_metrics": serialize_metrics(root_metrics),
             "best_metrics": serialize_metrics(nodes[best_node_id].metrics),
-            "timing": timing_summary,
         }
+        if timing_enabled and timing_summary is not None:
+            summary["timing"] = timing_summary
         save_json(artifacts / "summary.json", summary)
 
         return PlannerRunResult(

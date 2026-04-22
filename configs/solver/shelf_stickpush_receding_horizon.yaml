@@ -42,6 +42,7 @@ run:
     visual_save_images: true
     visual_save_frontier_csv: true
     visual_replay_stride: 2
+    diagnostics_timing_enabled: false
     entry_max_steps: 200
     sweep_max_steps: 200
     retract_max_steps: 100

@@ -72,6 +72,7 @@ class VisualConfig:
     save_frontier_csv: bool = True
     replay_stride: int = 2
     max_candidates_drawn: int = 300
+    save_timing_diagnostics: bool = False
 
 
 @dataclass
