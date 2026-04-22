@@ -27,6 +27,48 @@ class BatchExecutionResult:
     child_state: torch.Tensor
 
 
+def _ordered_backoffs(primary: float, candidates: tuple[float, ...]) -> list[float]:
+    ordered: list[float] = []
+
+    def _add(v: float | None):
+        if v is None:
+            return
+        vv = float(v)
+        if vv <= 0:
+            return
+        if any(abs(vv - x) < 1e-6 for x in ordered):
+            return
+        ordered.append(vv)
+
+    _add(primary)
+    for v in candidates:
+        _add(v)
+    return ordered
+
+
+def _clone_action(action: PlannerAction) -> PlannerAction:
+    return PlannerAction(
+        blocker_name=str(action.blocker_name),
+        theta_deg=float(action.theta_deg),
+        x_approach=float(action.x_approach),
+        delta_len_idx=int(action.delta_len_idx),
+        contact_offset=float(action.contact_offset),
+        push_len=float(action.push_len),
+        approach_xyz=np.asarray(action.approach_xyz, dtype=np.float32).copy(),
+        entry_xyz=np.asarray(action.entry_xyz, dtype=np.float32).copy(),
+        sweep_xyz=np.asarray(action.sweep_xyz, dtype=np.float32).copy(),
+        retract_xyz=np.asarray(action.retract_xyz, dtype=np.float32).copy(),
+        meta=dict(action.meta),
+    )
+
+
+def _clone_action_with_backoff(action: PlannerAction, *, backoff: float, front_x: float) -> PlannerAction:
+    cloned = _clone_action(action)
+    cloned.x_approach = float(backoff)
+    cloned.approach_xyz[0] = float(front_x - float(backoff))
+    return cloned
+
+
 class StickPushExecutor:
     """Bridges planner actions to StickPush waypoints."""
 
@@ -92,22 +134,7 @@ class StickPushExecutor:
         return info
 
     def _candidate_backoffs(self, action: PlannerAction) -> list[float]:
-        ordered: list[float] = []
-
-        def _add(v: float | None):
-            if v is None:
-                return
-            vv = float(v)
-            if vv <= 0:
-                return
-            if any(abs(vv - x) < 1e-6 for x in ordered):
-                return
-            ordered.append(vv)
-
-        _add(action.x_approach)
-        for v in self.staging_backoff_candidates:
-            _add(v)
-        return ordered
+        return _ordered_backoffs(float(action.x_approach), self.staging_backoff_candidates)
 
     def execute(
         self,
@@ -237,6 +264,20 @@ class StickPushExecutor:
             )
             chosen_backoff = float(action.x_approach)
             chosen_approach = approach_base.copy()
+            insertion_depth = float(entry[0] - chosen_approach[0])
+            chosen_info["insertion_depth"] = insertion_depth
+            attempted_backoffs.append(float(chosen_backoff))
+            attempt_row = {
+                "backoff": float(chosen_backoff),
+                "skipped": False,
+                "staging_success": bool(chosen_info["staging_success"]),
+                "entry_final_dist": float(chosen_info["entry_final_dist"]),
+                "sweep_final_dist": float(chosen_info["sweep_final_dist"]),
+            }
+            if self.timing_enabled:
+                attempt_row["attempt_wall_ms"] = float(attempt_wall_ms)
+                attempt_row["phase_timing_ms"] = dict(chosen_info.get("phase_timing_ms", {}))
+            attempt_summaries.append(attempt_row)
             if self.timing_enabled:
                 attempt_timing_ms.append(
                     {
@@ -292,6 +333,9 @@ class StickPushBatchExecutor:
         convergence_threshold: float = 0.01,
         staging_max_attempts: int = 2,
         staging_timeout: float = 3.0,
+        staging_fallback_enabled: bool = True,
+        staging_backoff_candidates: tuple[float, ...] = (0.05, 0.03, 0.09, 0.11),
+        staging_fallback_min_insertion_depth: float = 0.015,
     ):
         self.env = env
         self.raw = env.unwrapped
@@ -306,6 +350,71 @@ class StickPushBatchExecutor:
         self.convergence_threshold = float(convergence_threshold)
         self.staging_max_attempts = int(staging_max_attempts)
         self.staging_timeout = float(staging_timeout)
+        self.staging_fallback_enabled = bool(staging_fallback_enabled)
+        self.staging_backoff_candidates = tuple(float(v) for v in staging_backoff_candidates)
+        self.staging_fallback_min_insertion_depth = float(staging_fallback_min_insertion_depth)
+
+    def _candidate_backoffs(self, action: PlannerAction) -> list[float]:
+        if not self.staging_fallback_enabled:
+            return [float(action.x_approach)]
+        return _ordered_backoffs(float(action.x_approach), self.staging_backoff_candidates)
+
+    def _run_attempt_round(
+        self,
+        *,
+        parent_dev: torch.Tensor,
+        parent_state_2d: torch.Tensor,
+        actions: list[PlannerAction],
+        batch_size: int,
+    ) -> tuple[StickPushResult, torch.Tensor, float]:
+        # Always reset to the same parent state before each round to avoid
+        # cross-round contamination from previous failed attempts.
+        tiled_state = parent_dev.repeat(batch_size, 1)
+        self.raw.set_state(tiled_state)
+
+        active = int(len(actions))
+        ref_action = actions[0]
+        approach_np = np.stack([np.asarray(a.approach_xyz, dtype=np.float32) for a in actions], axis=0)
+        entry_np = np.stack([np.asarray(a.entry_xyz, dtype=np.float32) for a in actions], axis=0)
+        sweep_np = np.stack([np.asarray(a.sweep_xyz, dtype=np.float32) for a in actions], axis=0)
+        retract_np = np.stack([np.asarray(a.retract_xyz, dtype=np.float32) for a in actions], axis=0)
+
+        if active < batch_size:
+            n_pad = int(batch_size - active)
+            approach_pad = np.repeat(np.asarray(ref_action.approach_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
+            entry_pad = np.repeat(np.asarray(ref_action.entry_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
+            sweep_pad = np.repeat(np.asarray(ref_action.sweep_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
+            retract_pad = np.repeat(np.asarray(ref_action.retract_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
+            approach_np = np.concatenate([approach_np, approach_pad], axis=0)
+            entry_np = np.concatenate([entry_np, entry_pad], axis=0)
+            sweep_np = np.concatenate([sweep_np, sweep_pad], axis=0)
+            retract_np = np.concatenate([retract_np, retract_pad], axis=0)
+
+        q = self.q.to(self.cuda_device, dtype=torch.float32).expand(batch_size, -1).contiguous()
+        approach_t = torch.from_numpy(approach_np).to(self.cuda_device, dtype=torch.float32)
+        entry_t = torch.from_numpy(entry_np).to(self.cuda_device, dtype=torch.float32)
+        sweep_t = torch.from_numpy(sweep_np).to(self.cuda_device, dtype=torch.float32)
+        retract_t = torch.from_numpy(retract_np).to(self.cuda_device, dtype=torch.float32)
+
+        t_exec_ns = time.perf_counter_ns() if self.timing_enabled else 0
+        result = self.push_skill(
+            approach_positions=approach_t,
+            approach_quaternions=q,
+            entry_positions=entry_t,
+            sweep_positions=sweep_t,
+            retract_positions=retract_t,
+            entry_max_steps=self.entry_max_steps,
+            sweep_max_steps=self.sweep_max_steps,
+            retract_max_steps=self.retract_max_steps,
+            rest_steps=self.rest_steps,
+            staging_max_attempts=self.staging_max_attempts,
+            staging_timeout=self.staging_timeout,
+        )
+        exec_wall_ms = (
+            float(time.perf_counter_ns() - int(t_exec_ns)) / 1e6 if self.timing_enabled else 0.0
+        )
+        final_states = self.raw.get_state().clone().to(device=parent_state_2d.device)
+        return result, final_states, float(exec_wall_ms)
 
     @staticmethod
     def _build_result_info_at_index(
@@ -352,94 +461,220 @@ class StickPushBatchExecutor:
             parent_state_2d = parent_state_2d.unsqueeze(0)
 
         parent_dev = parent_state_2d.to(device=self.raw.device, dtype=torch.float32)
-        tiled_state = parent_dev.repeat(batch_size, 1)
-        self.raw.set_state(tiled_state)
+        t_batch_total_ns = time.perf_counter_ns() if self.timing_enabled else 0
+        batch_round_wall_sum_ms = 0.0
+        batch_round_count = 0
+        front_x = float(self.raw.shelf_geom.front_x)
 
-        active = int(len(actions))
-        ref_action = actions[0]
-        approach_np = np.stack([np.asarray(a.approach_xyz, dtype=np.float32) for a in actions], axis=0)
-        entry_np = np.stack([np.asarray(a.entry_xyz, dtype=np.float32) for a in actions], axis=0)
-        sweep_np = np.stack([np.asarray(a.sweep_xyz, dtype=np.float32) for a in actions], axis=0)
-        retract_np = np.stack([np.asarray(a.retract_xyz, dtype=np.float32) for a in actions], axis=0)
+        lane_records: list[dict] = []
+        for action in actions:
+            lane_records.append(
+                {
+                    "base_action": _clone_action(action),
+                    "next_backoffs": self._candidate_backoffs(action),
+                    "backoff_cursor": 0,
+                    "attempted_backoffs": [],
+                    "attempt_summaries": [],
+                    "attempt_timing_ms": [],
+                    "chosen_result": None,
+                    "chosen_slot": None,
+                    "chosen_info": None,
+                    "chosen_action": None,
+                    "chosen_state": None,
+                    "attempt_wall_sum": 0.0,
+                    "resolved": False,
+                }
+            )
 
-        if active < batch_size:
-            n_pad = int(batch_size - active)
-            approach_pad = np.repeat(np.asarray(ref_action.approach_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
-            entry_pad = np.repeat(np.asarray(ref_action.entry_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
-            sweep_pad = np.repeat(np.asarray(ref_action.sweep_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
-            retract_pad = np.repeat(np.asarray(ref_action.retract_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
-            approach_np = np.concatenate([approach_np, approach_pad], axis=0)
-            entry_np = np.concatenate([entry_np, entry_pad], axis=0)
-            sweep_np = np.concatenate([sweep_np, sweep_pad], axis=0)
-            retract_np = np.concatenate([retract_np, retract_pad], axis=0)
+        unresolved_lane_ids = set(range(len(actions)))
+        while unresolved_lane_ids:
+            round_lane_ids: list[int] = []
+            round_actions: list[PlannerAction] = []
 
-        q = self.q.to(self.cuda_device, dtype=torch.float32).expand(batch_size, -1).contiguous()
-        approach_t = torch.from_numpy(approach_np).to(self.cuda_device, dtype=torch.float32)
-        entry_t = torch.from_numpy(entry_np).to(self.cuda_device, dtype=torch.float32)
-        sweep_t = torch.from_numpy(sweep_np).to(self.cuda_device, dtype=torch.float32)
-        retract_t = torch.from_numpy(retract_np).to(self.cuda_device, dtype=torch.float32)
+            for lane_id in sorted(unresolved_lane_ids):
+                rec = lane_records[lane_id]
+                selected_action: PlannerAction | None = None
 
-        t_exec_ns = time.perf_counter_ns() if self.timing_enabled else 0
-        result = self.push_skill(
-            approach_positions=approach_t,
-            approach_quaternions=q,
-            entry_positions=entry_t,
-            sweep_positions=sweep_t,
-            retract_positions=retract_t,
-            entry_max_steps=self.entry_max_steps,
-            sweep_max_steps=self.sweep_max_steps,
-            retract_max_steps=self.retract_max_steps,
-            rest_steps=self.rest_steps,
-            staging_max_attempts=self.staging_max_attempts,
-            staging_timeout=self.staging_timeout,
-        )
-        exec_wall_ms = (
-            float(time.perf_counter_ns() - int(t_exec_ns)) / 1e6 if self.timing_enabled else 0.0
-        )
-        final_states = self.raw.get_state().clone()
+                while rec["backoff_cursor"] < len(rec["next_backoffs"]):
+                    backoff = float(rec["next_backoffs"][rec["backoff_cursor"]])
+                    rec["backoff_cursor"] += 1
+                    candidate = _clone_action_with_backoff(
+                        rec["base_action"],
+                        backoff=backoff,
+                        front_x=front_x,
+                    )
+                    insertion_depth = float(candidate.entry_xyz[0] - candidate.approach_xyz[0])
+                    if insertion_depth < self.staging_fallback_min_insertion_depth:
+                        rec["attempt_summaries"].append(
+                            {
+                                "backoff": float(backoff),
+                                "skipped": True,
+                                "reason": "min_insertion_depth",
+                                "insertion_depth": insertion_depth,
+                            }
+                        )
+                        continue
+                    selected_action = candidate
+                    break
+
+                if selected_action is None:
+                    rec["resolved"] = True
+                    continue
+
+                round_lane_ids.append(int(lane_id))
+                round_actions.append(selected_action)
+
+            if not round_actions:
+                break
+
+            result, final_states, exec_wall_ms = self._run_attempt_round(
+                parent_dev=parent_dev,
+                parent_state_2d=parent_state_2d,
+                actions=round_actions,
+                batch_size=batch_size,
+            )
+            batch_round_count += 1
+            batch_round_wall_sum_ms += float(exec_wall_ms)
+
+            for slot, lane_id in enumerate(round_lane_ids):
+                rec = lane_records[lane_id]
+                action = round_actions[slot]
+                info = self._build_result_info_at_index(
+                    result,
+                    slot,
+                    self.convergence_threshold,
+                    include_timing=self.timing_enabled,
+                )
+                insertion_depth = float(action.entry_xyz[0] - action.approach_xyz[0])
+                info["insertion_depth"] = insertion_depth
+                rec["attempted_backoffs"].append(float(action.x_approach))
+                rec["attempt_summaries"].append(
+                    {
+                        "backoff": float(action.x_approach),
+                        "skipped": False,
+                        "staging_success": bool(info["staging_success"]),
+                        "entry_final_dist": float(info["entry_final_dist"]),
+                        "sweep_final_dist": float(info["sweep_final_dist"]),
+                    }
+                )
+                if self.timing_enabled:
+                    rec["attempt_timing_ms"].append(
+                        {
+                            "backoff": float(action.x_approach),
+                            "attempt_wall_ms": float(exec_wall_ms),
+                            "phase_timing_ms": dict(info.get("phase_timing_ms", {})),
+                        }
+                    )
+                rec["attempt_wall_sum"] = float(rec["attempt_wall_sum"]) + float(exec_wall_ms)
+                rec["chosen_result"] = result
+                rec["chosen_slot"] = int(slot)
+                rec["chosen_info"] = dict(info)
+                rec["chosen_action"] = _clone_action(action)
+                rec["chosen_state"] = final_states[slot : slot + 1].clone()
+
+                if bool(info["staging_success"]):
+                    rec["resolved"] = True
+
+            unresolved_lane_ids = {i for i in unresolved_lane_ids if not lane_records[i]["resolved"]}
+
+        # Safety parity with single-action executor: if every candidate backoff
+        # was skipped, still run one attempt with the original approach.
+        safety_lane_ids = [i for i, rec in enumerate(lane_records) if rec["chosen_info"] is None]
+        if safety_lane_ids:
+            safety_actions = [_clone_action(lane_records[i]["base_action"]) for i in safety_lane_ids]
+            result, final_states, exec_wall_ms = self._run_attempt_round(
+                parent_dev=parent_dev,
+                parent_state_2d=parent_state_2d,
+                actions=safety_actions,
+                batch_size=batch_size,
+            )
+            batch_round_count += 1
+            batch_round_wall_sum_ms += float(exec_wall_ms)
+            for slot, lane_id in enumerate(safety_lane_ids):
+                rec = lane_records[lane_id]
+                action = safety_actions[slot]
+                info = self._build_result_info_at_index(
+                    result,
+                    slot,
+                    self.convergence_threshold,
+                    include_timing=self.timing_enabled,
+                )
+                insertion_depth = float(action.entry_xyz[0] - action.approach_xyz[0])
+                info["insertion_depth"] = insertion_depth
+                rec["attempted_backoffs"].append(float(action.x_approach))
+                rec["attempt_summaries"].append(
+                    {
+                        "backoff": float(action.x_approach),
+                        "skipped": False,
+                        "staging_success": bool(info["staging_success"]),
+                        "entry_final_dist": float(info["entry_final_dist"]),
+                        "sweep_final_dist": float(info["sweep_final_dist"]),
+                    }
+                )
+                if self.timing_enabled:
+                    rec["attempt_timing_ms"].append(
+                        {
+                            "backoff": float(action.x_approach),
+                            "attempt_wall_ms": float(exec_wall_ms),
+                            "phase_timing_ms": dict(info.get("phase_timing_ms", {})),
+                        }
+                    )
+                rec["attempt_wall_sum"] = float(rec["attempt_wall_sum"]) + float(exec_wall_ms)
+                rec["chosen_result"] = result
+                rec["chosen_slot"] = int(slot)
+                rec["chosen_info"] = dict(info)
+                rec["chosen_action"] = _clone_action(action)
+                rec["chosen_state"] = final_states[slot : slot + 1].clone()
 
         outputs: list[BatchExecutionResult] = []
-        for idx, action in enumerate(actions):
-            info = self._build_result_info_at_index(
-                result,
-                idx,
-                self.convergence_threshold,
-                include_timing=self.timing_enabled,
-            )
-            info["insertion_depth"] = float(np.asarray(action.entry_xyz, dtype=np.float32)[0] - np.asarray(action.approach_xyz, dtype=np.float32)[0])
-            info["staging_attempted_backoffs"] = [float(action.x_approach)]
-            info["staging_attempt_summaries"] = [
-                {
-                    "backoff": float(action.x_approach),
-                    "skipped": False,
-                    "staging_success": bool(info["staging_success"]),
-                    "entry_final_dist": float(info["entry_final_dist"]),
-                    "sweep_final_dist": float(info["sweep_final_dist"]),
-                }
-            ]
-            info["staging_used_backoff"] = float(action.x_approach)
-            info["staging_retry_count"] = 0
-            info["staging_fallback_applied"] = False
-            info["approach_xyz_used"] = np.asarray(action.approach_xyz, dtype=np.float32).tolist()
-            info["x_approach_used"] = float(action.x_approach)
-            info["entry_xyz_used"] = np.asarray(action.entry_xyz, dtype=np.float32).tolist()
-            info["sweep_xyz_used"] = np.asarray(action.sweep_xyz, dtype=np.float32).tolist()
-            info["retract_xyz_used"] = np.asarray(action.retract_xyz, dtype=np.float32).tolist()
-            info["batch_lane"] = int(idx)
-            info["batch_active"] = int(active)
-            info["batch_capacity"] = int(batch_size)
+        active = int(len(actions))
+        batch_execute_total_wall_ms = (
+            float(time.perf_counter_ns() - int(t_batch_total_ns)) / 1e6 if self.timing_enabled else 0.0
+        )
+        for idx, rec in enumerate(lane_records):
+            chosen_result: StickPushResult = rec["chosen_result"]
+            chosen_slot = int(rec["chosen_slot"])
+            chosen_info = dict(rec["chosen_info"])
+            chosen_action: PlannerAction = rec["chosen_action"]
+            base_action: PlannerAction = rec["base_action"]
+            chosen_backoff = float(chosen_action.x_approach)
+
+            chosen_info["staging_attempted_backoffs"] = [float(v) for v in rec["attempted_backoffs"]]
+            chosen_info["staging_attempt_summaries"] = list(rec["attempt_summaries"])
             if self.timing_enabled:
-                info["timing_ms"] = {
-                    "execute_total_wall": float(exec_wall_ms),
-                    "attempt_wall_sum": float(exec_wall_ms),
+                chosen_info["staging_attempt_timing_ms"] = list(rec["attempt_timing_ms"])
+            chosen_info["staging_used_backoff"] = float(chosen_backoff)
+            chosen_info["staging_retry_count"] = max(0, len(rec["attempted_backoffs"]) - 1)
+            chosen_info["staging_fallback_applied"] = bool(
+                abs(float(chosen_backoff) - float(base_action.x_approach)) > 1e-6
+            )
+            chosen_info["approach_xyz_used"] = np.asarray(chosen_action.approach_xyz, dtype=np.float32).tolist()
+            chosen_info["x_approach_used"] = float(chosen_backoff)
+            chosen_info["entry_xyz_used"] = np.asarray(chosen_action.entry_xyz, dtype=np.float32).tolist()
+            chosen_info["sweep_xyz_used"] = np.asarray(chosen_action.sweep_xyz, dtype=np.float32).tolist()
+            chosen_info["retract_xyz_used"] = np.asarray(chosen_action.retract_xyz, dtype=np.float32).tolist()
+            chosen_info["batch_lane"] = int(idx)
+            chosen_info["batch_active"] = int(active)
+            chosen_info["batch_capacity"] = int(batch_size)
+            if self.timing_enabled:
+                # Per-action/lane timing: sum of wall times for rounds where this lane
+                # was actually attempted (includes fallback retries for this lane).
+                lane_execute_total_wall_ms = float(rec["attempt_wall_sum"])
+                # Batch-level timing: shared across all lanes for this call.
+                chosen_info["timing_ms"] = {
+                    "execute_total_wall": lane_execute_total_wall_ms,
+                    "attempt_wall_sum": lane_execute_total_wall_ms,
+                    "batch_execute_total_wall": float(batch_execute_total_wall_ms),
+                    "batch_round_wall_sum": float(batch_round_wall_sum_ms),
+                    "batch_round_count": int(batch_round_count),
                 }
 
             execution = ExecutionResult(
-                success=bool(result.success_mask[idx].item() and bool(info["entry_converged"])),
-                steps_executed=int(result.steps_executed),
-                stick_result=result,
-                info=info,
+                success=bool(chosen_result.success_mask[chosen_slot].item() and bool(chosen_info["entry_converged"])),
+                steps_executed=int(chosen_result.steps_executed),
+                stick_result=chosen_result,
+                info=chosen_info,
             )
-            child_state = final_states[idx : idx + 1].to(device=parent_state_2d.device).clone()
+            child_state = rec["chosen_state"].to(device=parent_state_2d.device).clone()
             outputs.append(BatchExecutionResult(execution=execution, child_state=child_state))
         return outputs

@@ -358,6 +358,9 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
                 convergence_threshold=self.convergence_threshold,
                 staging_max_attempts=self.staging_max_attempts,
                 staging_timeout=self.staging_timeout,
+                staging_fallback_enabled=self.staging_fallback_enabled,
+                staging_backoff_candidates=tuple(self.staging_backoff_candidates),
+                staging_fallback_min_insertion_depth=self.staging_fallback_min_insertion_depth,
             )
         planner_cfg = self._build_planner_config()
         planner = StickPushRecedingHorizonSearch(
