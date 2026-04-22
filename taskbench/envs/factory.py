@@ -128,11 +128,12 @@ def make_batched_env(cfg):
 def make_single_env(cfg):
     """Create a single raw gym env for use with the motion planner.
 
-    Forces ``num_envs=1`` and ``sim_backend="cpu"`` so that mplib can
-    access ``env.unwrapped`` attributes directly.
+    Forces ``num_envs=1`` and uses ``runtime.sim_backend`` when set
+    (default ``cpu``) so solver-specific configs can opt into GPU PhysX.
     """
     rt = cfg.runtime
     render_mode = _resolved_render_mode(rt)
+    sim_backend = rt.get("sim_backend", "cpu")
 
     kwargs = _task_kwargs(cfg)
 
@@ -144,7 +145,7 @@ def make_single_env(cfg):
         num_envs=1,
         max_episode_steps=rt.max_episode_steps,
         render_mode=render_mode,
-        sim_backend="cpu",
+        sim_backend=sim_backend,
         **kwargs,
     )
 

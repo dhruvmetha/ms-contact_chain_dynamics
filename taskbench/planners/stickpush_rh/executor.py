@@ -21,6 +21,12 @@ class ExecutionResult:
     info: dict = field(default_factory=dict)
 
 
+@dataclass
+class BatchExecutionResult:
+    execution: ExecutionResult
+    child_state: torch.Tensor
+
+
 class StickPushExecutor:
     """Bridges planner actions to StickPush waypoints."""
 
@@ -266,3 +272,174 @@ class StickPushExecutor:
             stick_result=chosen_result,
             info=chosen_info,
         )
+
+
+class StickPushBatchExecutor:
+    """Execute multiple planner actions in parallel from one parent state."""
+
+    def __init__(
+        self,
+        env,
+        push_skill: StickPush,
+        *,
+        approach_quaternion_wxyz: list[float],
+        cuda_device: torch.device | None = None,
+        timing_enabled: bool = False,
+        entry_max_steps: int = 200,
+        sweep_max_steps: int = 200,
+        retract_max_steps: int = 100,
+        rest_steps: int = 60,
+        convergence_threshold: float = 0.01,
+        staging_max_attempts: int = 2,
+        staging_timeout: float = 3.0,
+    ):
+        self.env = env
+        self.raw = env.unwrapped
+        self.push_skill = push_skill
+        self.q = torch.tensor([approach_quaternion_wxyz], dtype=torch.float32)
+        self.cuda_device = cuda_device or torch.device("cuda:0")
+        self.timing_enabled = bool(timing_enabled)
+        self.entry_max_steps = int(entry_max_steps)
+        self.sweep_max_steps = int(sweep_max_steps)
+        self.retract_max_steps = int(retract_max_steps)
+        self.rest_steps = int(rest_steps)
+        self.convergence_threshold = float(convergence_threshold)
+        self.staging_max_attempts = int(staging_max_attempts)
+        self.staging_timeout = float(staging_timeout)
+
+    @staticmethod
+    def _build_result_info_at_index(
+        result: StickPushResult,
+        idx: int,
+        convergence_threshold: float,
+        *,
+        include_timing: bool,
+    ) -> dict:
+        entry_final_dist = float(result.entry_final_dist[idx].item())
+        sweep_final_dist = float(result.sweep_final_dist[idx].item())
+        retract_final_dist = float(result.retract_final_dist[idx].item())
+        orientation_drift = float(result.orientation_drift[idx].item())
+        entry_converged = entry_final_dist <= convergence_threshold
+        sweep_converged = sweep_final_dist <= convergence_threshold
+        info = {
+            "entry_final_dist": entry_final_dist,
+            "sweep_final_dist": sweep_final_dist,
+            "retract_final_dist": retract_final_dist,
+            "orientation_drift": orientation_drift,
+            "entry_converged": bool(entry_converged),
+            "sweep_converged": bool(sweep_converged),
+            "staging_success": bool(result.staging_success[idx].item()),
+            "convergence_threshold": float(convergence_threshold),
+        }
+        if include_timing:
+            info["phase_steps"] = {str(k): int(v) for k, v in dict(result.phase_steps).items()}
+            info["phase_timing_ms"] = {str(k): float(v) for k, v in dict(result.phase_timing_ms).items()}
+        return info
+
+    def execute_batch_from_parent_state(
+        self,
+        parent_state: torch.Tensor,
+        actions: list[PlannerAction],
+    ) -> list[BatchExecutionResult]:
+        if not actions:
+            return []
+        batch_size = int(self.raw.num_envs)
+        if len(actions) > batch_size:
+            raise ValueError(f"Got {len(actions)} actions but batch env has {batch_size} lanes")
+
+        parent_state_2d = parent_state
+        if parent_state_2d.ndim == 1:
+            parent_state_2d = parent_state_2d.unsqueeze(0)
+
+        parent_dev = parent_state_2d.to(device=self.raw.device, dtype=torch.float32)
+        tiled_state = parent_dev.repeat(batch_size, 1)
+        self.raw.set_state(tiled_state)
+
+        active = int(len(actions))
+        ref_action = actions[0]
+        approach_np = np.stack([np.asarray(a.approach_xyz, dtype=np.float32) for a in actions], axis=0)
+        entry_np = np.stack([np.asarray(a.entry_xyz, dtype=np.float32) for a in actions], axis=0)
+        sweep_np = np.stack([np.asarray(a.sweep_xyz, dtype=np.float32) for a in actions], axis=0)
+        retract_np = np.stack([np.asarray(a.retract_xyz, dtype=np.float32) for a in actions], axis=0)
+
+        if active < batch_size:
+            n_pad = int(batch_size - active)
+            approach_pad = np.repeat(np.asarray(ref_action.approach_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
+            entry_pad = np.repeat(np.asarray(ref_action.entry_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
+            sweep_pad = np.repeat(np.asarray(ref_action.sweep_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
+            retract_pad = np.repeat(np.asarray(ref_action.retract_xyz, dtype=np.float32)[None, :], n_pad, axis=0)
+            approach_np = np.concatenate([approach_np, approach_pad], axis=0)
+            entry_np = np.concatenate([entry_np, entry_pad], axis=0)
+            sweep_np = np.concatenate([sweep_np, sweep_pad], axis=0)
+            retract_np = np.concatenate([retract_np, retract_pad], axis=0)
+
+        q = self.q.to(self.cuda_device, dtype=torch.float32).expand(batch_size, -1).contiguous()
+        approach_t = torch.from_numpy(approach_np).to(self.cuda_device, dtype=torch.float32)
+        entry_t = torch.from_numpy(entry_np).to(self.cuda_device, dtype=torch.float32)
+        sweep_t = torch.from_numpy(sweep_np).to(self.cuda_device, dtype=torch.float32)
+        retract_t = torch.from_numpy(retract_np).to(self.cuda_device, dtype=torch.float32)
+
+        t_exec_ns = time.perf_counter_ns() if self.timing_enabled else 0
+        result = self.push_skill(
+            approach_positions=approach_t,
+            approach_quaternions=q,
+            entry_positions=entry_t,
+            sweep_positions=sweep_t,
+            retract_positions=retract_t,
+            entry_max_steps=self.entry_max_steps,
+            sweep_max_steps=self.sweep_max_steps,
+            retract_max_steps=self.retract_max_steps,
+            rest_steps=self.rest_steps,
+            staging_max_attempts=self.staging_max_attempts,
+            staging_timeout=self.staging_timeout,
+        )
+        exec_wall_ms = (
+            float(time.perf_counter_ns() - int(t_exec_ns)) / 1e6 if self.timing_enabled else 0.0
+        )
+        final_states = self.raw.get_state().clone()
+
+        outputs: list[BatchExecutionResult] = []
+        for idx, action in enumerate(actions):
+            info = self._build_result_info_at_index(
+                result,
+                idx,
+                self.convergence_threshold,
+                include_timing=self.timing_enabled,
+            )
+            info["insertion_depth"] = float(np.asarray(action.entry_xyz, dtype=np.float32)[0] - np.asarray(action.approach_xyz, dtype=np.float32)[0])
+            info["staging_attempted_backoffs"] = [float(action.x_approach)]
+            info["staging_attempt_summaries"] = [
+                {
+                    "backoff": float(action.x_approach),
+                    "skipped": False,
+                    "staging_success": bool(info["staging_success"]),
+                    "entry_final_dist": float(info["entry_final_dist"]),
+                    "sweep_final_dist": float(info["sweep_final_dist"]),
+                }
+            ]
+            info["staging_used_backoff"] = float(action.x_approach)
+            info["staging_retry_count"] = 0
+            info["staging_fallback_applied"] = False
+            info["approach_xyz_used"] = np.asarray(action.approach_xyz, dtype=np.float32).tolist()
+            info["x_approach_used"] = float(action.x_approach)
+            info["entry_xyz_used"] = np.asarray(action.entry_xyz, dtype=np.float32).tolist()
+            info["sweep_xyz_used"] = np.asarray(action.sweep_xyz, dtype=np.float32).tolist()
+            info["retract_xyz_used"] = np.asarray(action.retract_xyz, dtype=np.float32).tolist()
+            info["batch_lane"] = int(idx)
+            info["batch_active"] = int(active)
+            info["batch_capacity"] = int(batch_size)
+            if self.timing_enabled:
+                info["timing_ms"] = {
+                    "execute_total_wall": float(exec_wall_ms),
+                    "attempt_wall_sum": float(exec_wall_ms),
+                }
+
+            execution = ExecutionResult(
+                success=bool(result.success_mask[idx].item() and bool(info["entry_converged"])),
+                steps_executed=int(result.steps_executed),
+                stick_result=result,
+                info=info,
+            )
+            child_state = final_states[idx : idx + 1].to(device=parent_state_2d.device).clone()
+            outputs.append(BatchExecutionResult(execution=execution, child_state=child_state))
+        return outputs

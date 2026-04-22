@@ -81,6 +81,8 @@ class RecedingHorizonConfig:
 
     max_executions: int = 1000
     max_depth: int = 256
+    parallel_frontier_enabled: bool = False
+    parallel_frontier_batch_size: int = 1
     artifact_root: str = "artifacts/stickpush_rh"
     max_target_shift_xy: float = 0.02
     target_wall_margin: float = 0.01

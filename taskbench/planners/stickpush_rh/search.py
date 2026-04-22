@@ -9,7 +9,7 @@ import time
 import numpy as np
 
 from taskbench.planners.stickpush_rh.config import RecedingHorizonConfig
-from taskbench.planners.stickpush_rh.executor import StickPushExecutor
+from taskbench.planners.stickpush_rh.executor import StickPushBatchExecutor, StickPushExecutor
 from taskbench.planners.stickpush_rh.frontier_ucb import FrontierUCB
 from taskbench.planners.stickpush_rh.geometry import (
     compute_node_metrics,
@@ -105,6 +105,7 @@ class StickPushRecedingHorizonSearch:
         env,
         *,
         executor: StickPushExecutor,
+        batch_executor: StickPushBatchExecutor | None = None,
         cfg: RecedingHorizonConfig,
         state_provider: GTSceneStateProvider | None = None,
         sampler: StickPushSampler | None = None,
@@ -114,6 +115,7 @@ class StickPushRecedingHorizonSearch:
         self.raw = env.unwrapped
         self.cfg = cfg
         self.executor = executor
+        self.batch_executor = batch_executor
         self.state_provider = state_provider or GTSceneStateProvider(env_index=0)
         self.sampler = sampler or StickPushSampler(cfg.sampling)
         self.ucb = ucb or FrontierUCB(cfg.ucb)
@@ -246,6 +248,29 @@ class StickPushRecedingHorizonSearch:
             retract_xyz=np.asarray(action.retract_xyz, dtype=np.float32).copy(),
             meta=dict(action.meta),
         )
+
+    @staticmethod
+    def _capture_rgb_frame_from_env_index(env, env_index: int) -> np.ndarray:
+        try:
+            frame = env.render()
+        except RuntimeError as exc:
+            if "render_mode is not set" in str(exc):
+                return np.zeros((512, 512, 3), dtype=np.uint8)
+            raise
+        if frame is None:
+            return np.zeros((512, 512, 3), dtype=np.uint8)
+        if hasattr(frame, "detach") and hasattr(frame, "cpu"):
+            frame = frame.detach().cpu().numpy()
+        arr = np.asarray(frame)
+        if arr.ndim == 4:
+            idx = int(max(0, min(int(env_index), int(arr.shape[0]) - 1)))
+            arr = arr[idx]
+        if arr.dtype != np.uint8:
+            if arr.max() <= 1.0:
+                arr = (arr * 255.0).astype(np.uint8)
+            else:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return arr
 
     def _build_node_actions(
         self,
@@ -541,6 +566,9 @@ class StickPushRecedingHorizonSearch:
         solved_node_id: int | None = 0 if root_metrics.solved else None
         expansions = 0
         executions = 0
+        parallel_frontier_enabled = bool(self.cfg.parallel_frontier_enabled)
+        parallel_frontier_batch_size = max(1, int(self.cfg.parallel_frontier_batch_size))
+        pending_exec_queue: list[dict] = []
 
         t_root_artifact_io_ns = time.perf_counter_ns()
         save_image(artifacts / "root_before.png", capture_rgb_frame(self.env))
@@ -573,27 +601,84 @@ class StickPushRecedingHorizonSearch:
             t_frontier_scan_ns = time.perf_counter_ns()
             candidate_ids = self._expandable_node_ids(nodes)
             frontier_expandable_scan_ms = _elapsed_ms(t_frontier_scan_ns)
-            if not candidate_ids:
+            if (not candidate_ids) and (not pending_exec_queue):
                 break
             frontier_candidate_count = int(len(candidate_ids))
+            if pending_exec_queue:
+                queued = pending_exec_queue.pop(0)
+                node_id = int(queued["node_id"])
+                node = nodes[node_id]
+                action = queued["action"]
+                exec_result = queued["exec_result"]
+                scene_before = queued["scene_before"]
+                before_frame = queued["before_frame"]
+                prep_ms = 0.0
+                frontier_select_ms = 0.0
+                child_state_override = queued.get("child_state")
+                if child_state_override is not None:
+                    self.raw.set_state(child_state_override.clone())
+                exec_ms = float(queued.get("exec_ms", 0.0))
+            else:
+                t_frontier_select_ns = time.perf_counter_ns()
+                node_id = self.ucb.select(nodes, candidate_ids)
+                frontier_select_ms = _elapsed_ms(t_frontier_select_ns)
+                node = nodes[node_id]
 
-            t_frontier_select_ns = time.perf_counter_ns()
-            node_id = self.ucb.select(nodes, candidate_ids)
-            frontier_select_ms = _elapsed_ms(t_frontier_select_ns)
-            node = nodes[node_id]
+                self.raw.set_state(node.sim_state.clone())
+                scene_before = self.state_provider.get_scene_state(self.env)
+                before_frame = capture_rgb_frame(self.env)
 
-            self.raw.set_state(node.sim_state.clone())
-            scene_before = self.state_provider.get_scene_state(self.env)
-            before_frame = capture_rgb_frame(self.env)
+                if not node.untried_actions:
+                    continue
 
-            if not node.untried_actions:
-                continue
-            action = node.untried_actions.pop(0)
-            prep_ms = _elapsed_ms(t_prep_ns)
+                remaining_budget = int(max(0, self.cfg.max_executions - executions))
+                batch_count = 1
+                if (
+                    parallel_frontier_enabled
+                    and parallel_frontier_batch_size > 1
+                    and self.batch_executor is not None
+                ):
+                    batch_count = min(
+                        int(parallel_frontier_batch_size),
+                        int(len(node.untried_actions)),
+                        int(remaining_budget),
+                    )
+                actions_to_execute = [
+                    node.untried_actions.pop(0) for _ in range(max(1, int(batch_count)))
+                ]
+                prep_ms = _elapsed_ms(t_prep_ns)
 
-            t_exec_ns = time.perf_counter_ns()
-            exec_result = self.executor.execute(action)
-            exec_ms = _elapsed_ms(t_exec_ns)
+                if len(actions_to_execute) > 1 and self.batch_executor is not None:
+                    t_exec_ns = time.perf_counter_ns()
+                    batch_outputs = self.batch_executor.execute_batch_from_parent_state(
+                        node.sim_state,
+                        actions_to_execute,
+                    )
+                    exec_total_ms = _elapsed_ms(t_exec_ns)
+                    exec_per_action_ms = float(exec_total_ms / max(1, len(batch_outputs)))
+                    pending_exec_queue.extend(
+                        [
+                            {
+                                "node_id": int(node_id),
+                                "action": actions_to_execute[i],
+                                "exec_result": batch_outputs[i].execution,
+                                "child_state": batch_outputs[i].child_state,
+                                "scene_before": scene_before,
+                                "before_frame": before_frame,
+                                "exec_ms": float(exec_per_action_ms),
+                            }
+                            for i in range(1, len(batch_outputs))
+                        ]
+                    )
+                    action = actions_to_execute[0]
+                    exec_result = batch_outputs[0].execution
+                    self.raw.set_state(batch_outputs[0].child_state.clone())
+                    exec_ms = float(exec_per_action_ms)
+                else:
+                    action = actions_to_execute[0]
+                    t_exec_ns = time.perf_counter_ns()
+                    exec_result = self.executor.execute(action)
+                    exec_ms = _elapsed_ms(t_exec_ns)
             exec_internal_timing = dict(exec_result.info.get("timing_ms", {}))
             exec_phase_timing = dict(exec_result.info.get("phase_timing_ms", {}))
             exec_internal_total_ms = float(exec_internal_timing.get("execute_total_wall", 0.0))
@@ -965,7 +1050,6 @@ class StickPushRecedingHorizonSearch:
                     },
                 }
             )
-
             if child_metrics.solved:
                 solved_node_id = child_id
                 break
@@ -1068,6 +1152,19 @@ class StickPushRecedingHorizonSearch:
             "solve_depth": nodes[best_node_id].depth,
             "num_nodes": len(nodes),
             "artifact_dir": str(artifacts),
+            "parallel_frontier": {
+                "enabled": bool(parallel_frontier_enabled),
+                "batch_size": int(parallel_frontier_batch_size),
+                "execution_mode": (
+                    "batched_env_gpu_parallel"
+                    if (
+                        parallel_frontier_enabled
+                        and parallel_frontier_batch_size > 1
+                        and self.batch_executor is not None
+                    )
+                    else "sequential_single_env"
+                ),
+            },
             "root_metrics": serialize_metrics(root_metrics),
             "best_metrics": serialize_metrics(nodes[best_node_id].metrics),
         }

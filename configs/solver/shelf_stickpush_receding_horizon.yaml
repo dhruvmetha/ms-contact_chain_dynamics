@@ -5,6 +5,8 @@ run:
   solver_kwargs:
     max_executions: 1000
     max_depth: 256
+    parallel_frontier_enabled: false
+    parallel_frontier_batch_size: 4
     clearance_radius: 0.10
     heading_degrees: [0, 45, 90, 135, 180, 225, 270, 315]
     x_approach_values: [0.07]
@@ -56,6 +58,7 @@ run:
     artifact_root: artifacts/stickpush_rh
 
 runtime:
+  sim_backend: gpu
   control_mode: pd_joint_pos
   num_envs: 1
   obs_mode: state

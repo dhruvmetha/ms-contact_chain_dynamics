@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gymnasium as gym
 import torch
 
 from taskbench.planners.stickpush_rh.config import (
@@ -10,7 +11,7 @@ from taskbench.planners.stickpush_rh.config import (
     UCBConfig,
     VisualConfig,
 )
-from taskbench.planners.stickpush_rh.executor import StickPushExecutor
+from taskbench.planners.stickpush_rh.executor import StickPushBatchExecutor, StickPushExecutor
 from taskbench.planners.stickpush_rh.search import StickPushRecedingHorizonSearch
 from taskbench.planners.stickpush_rh.state_provider import GTSceneStateProvider
 from taskbench.skills.curobo_motion import get_arm_joint_names, setup_curobo_planner
@@ -35,6 +36,8 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         *,
         max_executions: int = 1000,
         max_depth: int = 256,
+        parallel_frontier_enabled: bool = False,
+        parallel_frontier_batch_size: int = 1,
         clearance_radius: float = 0.10,
         heading_degrees: list[float] | None = None,
         x_approach_values: list[float] | None = None,
@@ -87,6 +90,8 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
     ):
         self.max_executions = int(max_executions)
         self.max_depth = int(max_depth)
+        self.parallel_frontier_enabled = bool(parallel_frontier_enabled)
+        self.parallel_frontier_batch_size = max(1, int(parallel_frontier_batch_size))
         self.clearance_radius = float(clearance_radius)
         self.heading_degrees = heading_degrees
         self.x_approach_values = x_approach_values
@@ -192,6 +197,8 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         return RecedingHorizonConfig(
             max_executions=self.max_executions,
             max_depth=self.max_depth,
+            parallel_frontier_enabled=self.parallel_frontier_enabled,
+            parallel_frontier_batch_size=self.parallel_frontier_batch_size,
             artifact_root=self.artifact_root,
             max_target_shift_xy=self.max_target_shift_xy,
             target_wall_margin=self.target_wall_margin,
@@ -265,15 +272,106 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
             staging_backoff_candidates=tuple(self.staging_backoff_candidates),
             staging_fallback_min_insertion_depth=self.staging_fallback_min_insertion_depth,
         )
+        batch_executor: StickPushBatchExecutor | None = None
+        batch_env = None
+        batch_parallel_enabled = bool(self.parallel_frontier_enabled and self.parallel_frontier_batch_size > 1)
+        if batch_parallel_enabled:
+            batch_env = gym.make(
+                "ShelfEnv-v1",
+                num_envs=int(self.parallel_frontier_batch_size),
+                sim_backend="gpu",
+                robot_uids=ROBOT_UID,
+                robot_base_pose=[-0.4, 0.15, 0.0, 1.0, 0.0, 0.0, 0.0],
+                obs_mode="state",
+                reward_mode="none",
+                control_mode="pd_joint_pos",
+                render_mode="rgb_array",
+                num_objects=int(getattr(raw, "num_objects", len(raw.shelf_objects))),
+                shelf={
+                    "front_x": float(g.front_x),
+                    "depth": float(g.depth),
+                    "half_w": float(g.half_w),
+                    "floor_z": float(g.floor_z),
+                    "thickness": float(g.thickness),
+                    "inner_h": float(g.inner_h),
+                },
+                cylinder={
+                    "radius": float(getattr(raw.cyl_spec, "radius", 0.018)),
+                    "half_length": float(getattr(raw.cyl_spec, "half_length", 0.045)),
+                },
+            )
+            batch_env.reset(seed=seed)
+            batch_raw = batch_env.unwrapped
+            batch_n_envs = int(batch_raw.num_envs)
+            batch_qpos = batch_raw.agent.robot.get_qpos().clone()
+            batch_rest = (
+                torch.tensor(REST_QPOS, device=batch_raw.device, dtype=torch.float32)
+                .unsqueeze(0)
+                .expand(batch_n_envs, -1)
+            )
+            batch_qpos[:, :n_arm] = batch_rest
+            batch_raw.agent.robot.set_qpos(batch_qpos)
+            batch_raw.agent.set_control_mode("pd_joint_pos")
+            batch_raw.agent.controller.reset()
+            for _ in range(5):
+                batch_env.step(batch_rest)
+
+            bg = batch_raw.shelf_geom
+            brobot_base = batch_raw.agent.robot.pose.p[0].cpu().numpy()
+            bshelf_center = [
+                float(bg.center_x - brobot_base[0]),
+                float(-brobot_base[1]),
+                float(bg.ceil_z / 2 - brobot_base[2]),
+            ]
+            bshelf_dims = [float(bg.depth + 0.04), float(2 * bg.half_w + 0.04), float(bg.ceil_z + 0.04)]
+            bworld = WorldConfig(
+                cuboid=[
+                    Cuboid(
+                        name="shelf",
+                        pose=[bshelf_center[0], bshelf_center[1], bshelf_center[2], 1, 0, 0, 0],
+                        dims=bshelf_dims,
+                    )
+                ]
+            )
+            batch_motion_gen = setup_curobo_planner(ROBOT_UID, world_configs=bworld, n_envs=1, warmup=True)
+            batch_robot_base_pos = batch_raw.agent.robot.pose.p[0].to(device=cuda_device).unsqueeze(0)
+            batch_push_skill = StickPush(
+                batch_env,
+                batch_motion_gen,
+                robot_uid=ROBOT_UID,
+                n_envs=batch_n_envs,
+                n_arm_joints=n_arm,
+                rest_qpos=REST_QPOS,
+                robot_base_pos=batch_robot_base_pos,
+                safe_start_qpos=SAFE_QPOS,
+            )
+            batch_executor = StickPushBatchExecutor(
+                batch_env,
+                batch_push_skill,
+                approach_quaternion_wxyz=Q_INTO_SHELF,
+                cuda_device=cuda_device,
+                timing_enabled=self.diagnostics_timing_enabled,
+                entry_max_steps=self.entry_max_steps,
+                sweep_max_steps=self.sweep_max_steps,
+                retract_max_steps=self.retract_max_steps,
+                rest_steps=self.rest_steps,
+                convergence_threshold=self.convergence_threshold,
+                staging_max_attempts=self.staging_max_attempts,
+                staging_timeout=self.staging_timeout,
+            )
         planner_cfg = self._build_planner_config()
         planner = StickPushRecedingHorizonSearch(
             env,
             executor=executor,
+            batch_executor=batch_executor,
             cfg=planner_cfg,
             state_provider=GTSceneStateProvider(env_index=0),
         )
-
-        run_result = planner.run(seed=seed)
+        try:
+            run_result = planner.run(seed=seed)
+        finally:
+            if batch_env is not None:
+                batch_env.close()
         return SolverResult(
             success=run_result.success,
             elapsed_steps=run_result.executions,
