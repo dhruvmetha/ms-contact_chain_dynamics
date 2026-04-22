@@ -261,16 +261,32 @@ def solve_straight_insertion(
 
     p1_y = float(p1_xy[1])
     ys = grid.source_world_xy[:, 1]
-    order = np.argsort(np.abs(ys - p1_y), kind="stable")
-    if int(cfg.insertion_max_source_trials) > 0:
-        order = order[: int(cfg.insertion_max_source_trials)]
+    order_full = np.argsort(np.abs(ys - p1_y), kind="stable")
+    max_trials = int(cfg.insertion_max_source_trials)
+    if max_trials > 0:
+        order_primary = order_full[:max_trials]
+        order_fallback = order_full[max_trials:]
+    else:
+        order_primary = order_full
+        order_fallback = np.zeros((0,), dtype=order_full.dtype)
 
-    for idx in order:
-        source_xy = grid.source_world_xy[int(idx)]
-        if not line_collision_free(grid, source_xy, p1_xy, allow_end_occupied=True):
-            continue
+    def _first_collision_free(order: np.ndarray) -> np.ndarray | None:
+        for idx in order:
+            source_xy = grid.source_world_xy[int(idx)]
+            if not line_collision_free(grid, source_xy, p1_xy, allow_end_occupied=True):
+                continue
+            return source_xy
+        return None
+
+    # Fast path: closest-y opening sources first.
+    source_xy = _first_collision_free(order_primary)
+    if source_xy is None and order_fallback.size > 0:
+        # Fallback prevents false negatives when a feasible insertion exists but
+        # lies outside the truncated nearest-y source set.
+        source_xy = _first_collision_free(order_fallback)
+    if source_xy is not None:
         return StraightInsertionPlan(
-            source_xy=source_xy.astype(np.float32),
+            source_xy=np.asarray(source_xy, dtype=np.float32),
             approach_backoff=float(cfg.insertion_approach_backoff),
             wavefront_dist=wavefront_dist,
         )

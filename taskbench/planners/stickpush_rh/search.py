@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import time
 
 import numpy as np
 
@@ -12,6 +13,7 @@ from taskbench.planners.stickpush_rh.executor import StickPushExecutor
 from taskbench.planners.stickpush_rh.frontier_ucb import FrontierUCB
 from taskbench.planners.stickpush_rh.geometry import (
     compute_node_metrics,
+    front_semicircle_wall_intersections,
     grasp_semicircle_center_xy,
     hash_scene_state,
 )
@@ -34,6 +36,52 @@ from taskbench.planners.stickpush_rh.sampler import StickPushSampler
 from taskbench.planners.stickpush_rh.state_provider import GTSceneStateProvider
 from taskbench.planners.stickpush_rh.types import NodeMetrics, PlannerAction, SearchNode
 from taskbench.planners.stickpush_rh.viz import capture_rgb_frame, render_candidate_map
+
+
+def _elapsed_ms(start_ns: int) -> float:
+    return float(time.perf_counter_ns() - int(start_ns)) / 1e6
+
+
+def _stats_ms(values: list[float]) -> dict:
+    if not values:
+        return {
+            "count": 0,
+            "sum_ms": 0.0,
+            "mean_ms": 0.0,
+            "median_ms": 0.0,
+            "p95_ms": 0.0,
+            "max_ms": 0.0,
+        }
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        "count": int(arr.size),
+        "sum_ms": float(arr.sum()),
+        "mean_ms": float(arr.mean()),
+        "median_ms": float(np.percentile(arr, 50)),
+        "p95_ms": float(np.percentile(arr, 95)),
+        "max_ms": float(arr.max()),
+    }
+
+
+def _stats_scalar(values: list[float]) -> dict:
+    if not values:
+        return {
+            "count": 0,
+            "sum": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+        }
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        "count": int(arr.size),
+        "sum": float(arr.sum()),
+        "mean": float(arr.mean()),
+        "median": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+        "max": float(arr.max()),
+    }
 
 
 @dataclass
@@ -143,11 +191,13 @@ class StickPushRecedingHorizonSearch:
         shift_ok = shift_xy <= float(self.cfg.max_target_shift_xy)
         grasp_center_xy = grasp_semicircle_center_xy(scene.target, scene.open_dir_xy)
 
-        # Front side is open; only side/back walls are considered.
+        # Front side is open; wall checks are limited to intersections with the
+        # front semicircle region (same region used for blocker clearance).
         side_wall_dist = float(scene.shelf_half_w - abs(float(grasp_center_xy[1])))
         back_wall_dist = float(scene.shelf_back_x - float(grasp_center_xy[0]))
         wall_radius = float(self.cfg.sampling.clearance_radius)
-        wall_in_radius = bool((side_wall_dist <= wall_radius) or (back_wall_dist <= wall_radius))
+        wall_hits = front_semicircle_wall_intersections(scene, wall_radius)
+        wall_in_radius = bool(len(wall_hits) > 0)
 
         return {
             "target_xy": target_xy.tolist(),
@@ -158,6 +208,7 @@ class StickPushRecedingHorizonSearch:
             "back_wall_dist": back_wall_dist,
             "wall_radius_threshold": wall_radius,
             "wall_in_radius": wall_in_radius,
+            "wall_intersections": wall_hits,
             "target_wall_margin": float(self.cfg.target_wall_margin),
             "max_target_shift_xy": float(self.cfg.max_target_shift_xy),
         }
@@ -202,58 +253,102 @@ class StickPushRecedingHorizonSearch:
         state_hash: str,
         rng: np.random.Generator,
     ) -> tuple[list[PlannerAction], dict]:
+        t_total_ns = time.perf_counter_ns()
+
         if not self.cfg.sampling.use_wavefront_insertion_solver:
+            t_sampling_ns = time.perf_counter_ns()
             sampled_actions = self.sampler.sample_actions(scene)
+            sampling_ms = _elapsed_ms(t_sampling_ns)
+            t_shuffle_ns = time.perf_counter_ns()
+            shuffled = self._shuffle_actions(sampled_actions, rng)
+            shuffle_ms = _elapsed_ms(t_shuffle_ns)
             diagnostics = {
                 "num_sampled_actions": int(len(sampled_actions)),
                 "num_feasible_actions": int(len(sampled_actions)),
                 "wavefront_used": False,
                 "wavefront_cache_hit": False,
+                "action_cache_hit": False,
                 "rejected_infeasible_insertion": 0,
+                "num_insertion_checks": 0,
+                "num_insertion_solved": 0,
+                "timing_ms": {
+                    "total": _elapsed_ms(t_total_ns),
+                    "sampling": sampling_ms,
+                    "wavefront_build": 0.0,
+                    "insertion_filter": 0.0,
+                    "insertion_solver_only": 0.0,
+                    "cache_clone": 0.0,
+                    "shuffle": shuffle_ms,
+                },
             }
-            return self._shuffle_actions(sampled_actions, rng), diagnostics
+            return shuffled, diagnostics
 
         if state_hash in self._feasible_action_cache:
+            t_cache_clone_ns = time.perf_counter_ns()
             cached = [self._clone_action(a) for a in self._feasible_action_cache[state_hash]]
-            diagnostics = dict(
-                self._action_diag_cache.get(
-                    state_hash,
-                    {
-                        "num_sampled_actions": int(len(cached)),
-                        "num_feasible_actions": int(len(cached)),
-                        "wavefront_used": True,
-                        "wavefront_cache_hit": True,
-                        "rejected_infeasible_insertion": 0,
-                    },
-                )
-            )
-            diagnostics["wavefront_cache_hit"] = True
-            return self._shuffle_actions(cached, rng), diagnostics
+            cache_clone_ms = _elapsed_ms(t_cache_clone_ns)
+            t_shuffle_ns = time.perf_counter_ns()
+            shuffled = self._shuffle_actions(cached, rng)
+            shuffle_ms = _elapsed_ms(t_shuffle_ns)
+            diagnostics = {
+                "num_sampled_actions": int(len(cached)),
+                "num_feasible_actions": int(len(cached)),
+                "wavefront_used": True,
+                "wavefront_cache_hit": True,
+                "action_cache_hit": True,
+                "rejected_infeasible_insertion": 0,
+                "num_insertion_checks": 0,
+                "num_insertion_solved": int(len(cached)),
+                "timing_ms": {
+                    "total": _elapsed_ms(t_total_ns),
+                    "sampling": 0.0,
+                    "wavefront_build": 0.0,
+                    "insertion_filter": 0.0,
+                    "insertion_solver_only": 0.0,
+                    "cache_clone": cache_clone_ms,
+                    "shuffle": shuffle_ms,
+                },
+            }
+            return shuffled, diagnostics
 
+        t_sampling_ns = time.perf_counter_ns()
         sampled_actions = self.sampler.sample_actions(scene)
+        sampling_ms = _elapsed_ms(t_sampling_ns)
         diagnostics = {
             "num_sampled_actions": int(len(sampled_actions)),
             "num_feasible_actions": int(len(sampled_actions)),
             "wavefront_used": True,
             "wavefront_cache_hit": False,
+            "action_cache_hit": False,
             "rejected_infeasible_insertion": 0,
+            "num_insertion_checks": 0,
+            "num_insertion_solved": 0,
         }
 
+        wavefront_build_ms = 0.0
         if state_hash in self._wavefront_cache:
             wavefront = self._wavefront_cache[state_hash]
             diagnostics["wavefront_cache_hit"] = True
         else:
+            t_wavefront_ns = time.perf_counter_ns()
             wavefront = build_wavefront_grid(scene, self.cfg.sampling)
             self._wavefront_cache[state_hash] = wavefront
+            wavefront_build_ms = _elapsed_ms(t_wavefront_ns)
 
+        t_insertion_filter_ns = time.perf_counter_ns()
+        insertion_solver_only_ms = 0.0
+        insertion_checks = 0
         feasible_actions: list[PlannerAction] = []
         for action in sampled_actions:
+            insertion_checks += 1
+            t_solver_ns = time.perf_counter_ns()
             plan = solve_straight_insertion(
                 wavefront,
                 scene,
                 action.entry_xyz[:2],
                 self.cfg.sampling,
             )
+            insertion_solver_only_ms += _elapsed_ms(t_solver_ns)
             if plan is None:
                 continue
 
@@ -296,17 +391,110 @@ class StickPushRecedingHorizonSearch:
                 )
             )
 
+        insertion_filter_ms = _elapsed_ms(t_insertion_filter_ns)
         diagnostics["num_feasible_actions"] = int(len(feasible_actions))
         diagnostics["rejected_infeasible_insertion"] = int(len(sampled_actions) - len(feasible_actions))
+        diagnostics["num_insertion_checks"] = int(insertion_checks)
+        diagnostics["num_insertion_solved"] = int(len(feasible_actions))
+        diagnostics["timing_ms"] = {
+            "total": 0.0,
+            "sampling": sampling_ms,
+            "wavefront_build": wavefront_build_ms,
+            "insertion_filter": insertion_filter_ms,
+            "insertion_solver_only": insertion_solver_only_ms,
+            "cache_clone": 0.0,
+            "shuffle": 0.0,
+        }
         self._feasible_action_cache[state_hash] = [self._clone_action(a) for a in feasible_actions]
         self._action_diag_cache[state_hash] = dict(diagnostics)
+        t_shuffle_ns = time.perf_counter_ns()
         shuffled = self._shuffle_actions([self._clone_action(a) for a in feasible_actions], rng)
+        shuffle_ms = _elapsed_ms(t_shuffle_ns)
+        diagnostics["timing_ms"]["shuffle"] = shuffle_ms
+        diagnostics["timing_ms"]["total"] = _elapsed_ms(t_total_ns)
         return shuffled, diagnostics
 
     def run(self, seed: int | None = None) -> PlannerRunResult:
+        t_run_ns = time.perf_counter_ns()
         rng = np.random.default_rng(seed)
         artifacts = build_artifact_dir(self.cfg.artifact_root, seed)
         root_state = self.raw.get_state().clone()
+
+        action_gen_rows: list[dict] = []
+        expansion_timing_rows: list[dict] = []
+        action_gen_total_ms: list[float] = []
+        action_gen_sampling_ms: list[float] = []
+        action_gen_wavefront_build_ms: list[float] = []
+        action_gen_insertion_filter_ms: list[float] = []
+        action_gen_insertion_solver_ms: list[float] = []
+        action_gen_cache_clone_ms: list[float] = []
+        action_gen_shuffle_ms: list[float] = []
+        action_gen_cache_hits = 0
+        action_gen_wavefront_cache_hits = 0
+        execution_ms_values: list[float] = []
+        expansion_total_ms_values: list[float] = []
+        expansion_prep_ms_values: list[float] = []
+        expansion_child_eval_ms_values: list[float] = []
+        expansion_child_action_gen_ms_values: list[float] = []
+        expansion_artifact_io_ms_values: list[float] = []
+        frontier_expandable_scan_ms_values: list[float] = []
+        frontier_select_ms_values: list[float] = []
+        frontier_candidate_count_values: list[float] = []
+        execution_internal_total_ms_values: list[float] = []
+        execution_phase_stage_plan_ms_values: list[float] = []
+        execution_phase_stage_execute_ms_values: list[float] = []
+        execution_phase_entry_ms_values: list[float] = []
+        execution_phase_sweep_ms_values: list[float] = []
+        execution_phase_retract_nudge_ms_values: list[float] = []
+        execution_phase_retract_pull_ms_values: list[float] = []
+        execution_phase_return_to_rest_ms_values: list[float] = []
+        execution_phase_motion_total_excl_plan_ms_values: list[float] = []
+        execution_phase_motion_total_incl_plan_ms_values: list[float] = []
+        reject_reason_counts: dict[str, int] = {}
+
+        def _record_action_generation(
+            *,
+            stage: str,
+            node_id: int,
+            depth: int,
+            diagnostics: dict,
+        ) -> None:
+            nonlocal action_gen_cache_hits, action_gen_wavefront_cache_hits
+            timing = diagnostics.get("timing_ms", {}) if isinstance(diagnostics, dict) else {}
+            row = {
+                "stage": str(stage),
+                "node_id": int(node_id),
+                "depth": int(depth),
+                "num_sampled_actions": int(diagnostics.get("num_sampled_actions", 0)),
+                "num_feasible_actions": int(diagnostics.get("num_feasible_actions", 0)),
+                "rejected_infeasible_insertion": int(diagnostics.get("rejected_infeasible_insertion", 0)),
+                "num_insertion_checks": int(diagnostics.get("num_insertion_checks", 0)),
+                "num_insertion_solved": int(diagnostics.get("num_insertion_solved", 0)),
+                "wavefront_used": bool(diagnostics.get("wavefront_used", False)),
+                "wavefront_cache_hit": bool(diagnostics.get("wavefront_cache_hit", False)),
+                "action_cache_hit": bool(diagnostics.get("action_cache_hit", False)),
+                "timing_ms": {
+                    "total": float(timing.get("total", 0.0)),
+                    "sampling": float(timing.get("sampling", 0.0)),
+                    "wavefront_build": float(timing.get("wavefront_build", 0.0)),
+                    "insertion_filter": float(timing.get("insertion_filter", 0.0)),
+                    "insertion_solver_only": float(timing.get("insertion_solver_only", 0.0)),
+                    "cache_clone": float(timing.get("cache_clone", 0.0)),
+                    "shuffle": float(timing.get("shuffle", 0.0)),
+                },
+            }
+            action_gen_rows.append(row)
+            action_gen_total_ms.append(float(row["timing_ms"]["total"]))
+            action_gen_sampling_ms.append(float(row["timing_ms"]["sampling"]))
+            action_gen_wavefront_build_ms.append(float(row["timing_ms"]["wavefront_build"]))
+            action_gen_insertion_filter_ms.append(float(row["timing_ms"]["insertion_filter"]))
+            action_gen_insertion_solver_ms.append(float(row["timing_ms"]["insertion_solver_only"]))
+            action_gen_cache_clone_ms.append(float(row["timing_ms"]["cache_clone"]))
+            action_gen_shuffle_ms.append(float(row["timing_ms"]["shuffle"]))
+            if bool(row["action_cache_hit"]):
+                action_gen_cache_hits += 1
+            if bool(row["wavefront_cache_hit"]):
+                action_gen_wavefront_cache_hits += 1
 
         root_scene = self.state_provider.get_scene_state(self.env)
         root_metrics = compute_node_metrics(
@@ -323,6 +511,7 @@ class StickPushRecedingHorizonSearch:
             state_hash=root_state_hash,
             rng=rng,
         )
+        _record_action_generation(stage="root", node_id=0, depth=0, diagnostics=root_action_diag)
 
         nodes: dict[int, SearchNode] = {
             0: SearchNode(
@@ -344,6 +533,7 @@ class StickPushRecedingHorizonSearch:
         expansions = 0
         executions = 0
 
+        t_root_artifact_io_ns = time.perf_counter_ns()
         save_image(artifacts / "root_before.png", capture_rgb_frame(self.env))
         save_image(
             artifacts / "root_candidates.png",
@@ -365,13 +555,22 @@ class StickPushRecedingHorizonSearch:
                 **root_goal_diag,
             },
         )
+        root_artifact_io_ms = _elapsed_ms(t_root_artifact_io_ns)
 
+        t_search_loop_ns = time.perf_counter_ns()
         while solved_node_id is None and executions < self.cfg.max_executions:
+            t_expansion_ns = time.perf_counter_ns()
+            t_prep_ns = time.perf_counter_ns()
+            t_frontier_scan_ns = time.perf_counter_ns()
             candidate_ids = self._expandable_node_ids(nodes)
+            frontier_expandable_scan_ms = _elapsed_ms(t_frontier_scan_ns)
             if not candidate_ids:
                 break
+            frontier_candidate_count = int(len(candidate_ids))
 
+            t_frontier_select_ns = time.perf_counter_ns()
             node_id = self.ucb.select(nodes, candidate_ids)
+            frontier_select_ms = _elapsed_ms(t_frontier_select_ns)
             node = nodes[node_id]
 
             self.raw.set_state(node.sim_state.clone())
@@ -381,8 +580,27 @@ class StickPushRecedingHorizonSearch:
             if not node.untried_actions:
                 continue
             action = node.untried_actions.pop(0)
+            prep_ms = _elapsed_ms(t_prep_ns)
 
+            t_exec_ns = time.perf_counter_ns()
             exec_result = self.executor.execute(action)
+            exec_ms = _elapsed_ms(t_exec_ns)
+            exec_internal_timing = dict(exec_result.info.get("timing_ms", {}))
+            exec_phase_timing = dict(exec_result.info.get("phase_timing_ms", {}))
+            exec_internal_total_ms = float(exec_internal_timing.get("execute_total_wall", 0.0))
+            exec_phase_stage_plan_ms = float(exec_phase_timing.get("stage_plan", 0.0))
+            exec_phase_stage_execute_ms = float(exec_phase_timing.get("stage_execute", 0.0))
+            exec_phase_entry_ms = float(exec_phase_timing.get("entry_move", 0.0))
+            exec_phase_sweep_ms = float(exec_phase_timing.get("sweep_move", 0.0))
+            exec_phase_retract_nudge_ms = float(exec_phase_timing.get("retract_nudge", 0.0))
+            exec_phase_retract_pull_ms = float(exec_phase_timing.get("retract_pull", 0.0))
+            exec_phase_return_to_rest_ms = float(exec_phase_timing.get("return_to_rest", 0.0))
+            exec_phase_motion_total_excl_plan_ms = float(
+                exec_phase_timing.get("motion_total_excluding_stage_plan", 0.0)
+            )
+            exec_phase_motion_total_incl_plan_ms = float(
+                exec_phase_timing.get("motion_total_including_stage_plan", 0.0)
+            )
             executed_action = self._clone_action(action)
             used_approach = exec_result.info.get("approach_xyz_used")
             if used_approach is not None:
@@ -400,13 +618,18 @@ class StickPushRecedingHorizonSearch:
             elif not bool(exec_result.info.get("entry_converged", True)):
                 reject_reason = "insert_not_converged"
 
+            child_eval_ms = 0.0
+            child_action_generation_ms = 0.0
+            t_child_eval_ns = time.perf_counter_ns()
             if reject_reason is not None:
                 # Reject samples that fail to reach insertion waypoint.
                 self._backprop(nodes, node_id, reward=0.0)
+                child_eval_ms = _elapsed_ms(t_child_eval_ns)
                 expansions += 1
                 executions += 1
                 exp_dir = artifacts / f"exp_{expansions:06d}"
 
+                t_artifact_io_ns = time.perf_counter_ns()
                 after_frame = capture_rgb_frame(self.env)
                 if self.cfg.visual.save_expansion_images:
                     save_image(exp_dir / "before.png", before_frame)
@@ -453,6 +676,73 @@ class StickPushRecedingHorizonSearch:
                         exp_dir / "frontier.csv",
                         self._frontier_rows(nodes),
                     )
+                artifact_io_ms = _elapsed_ms(t_artifact_io_ns)
+                total_ms = _elapsed_ms(t_expansion_ns)
+                timing_ms = {
+                    "frontier_expandable_scan": frontier_expandable_scan_ms,
+                    "frontier_select": frontier_select_ms,
+                    "prep": prep_ms,
+                    "execute": exec_ms,
+                    "child_eval": child_eval_ms,
+                    "child_action_generation": child_action_generation_ms,
+                    "artifact_io": artifact_io_ms,
+                    "total": total_ms,
+                }
+                frontier_expandable_scan_ms_values.append(frontier_expandable_scan_ms)
+                frontier_select_ms_values.append(frontier_select_ms)
+                frontier_candidate_count_values.append(float(frontier_candidate_count))
+                execution_ms_values.append(exec_ms)
+                execution_internal_total_ms_values.append(exec_internal_total_ms)
+                execution_phase_stage_plan_ms_values.append(exec_phase_stage_plan_ms)
+                execution_phase_stage_execute_ms_values.append(exec_phase_stage_execute_ms)
+                execution_phase_entry_ms_values.append(exec_phase_entry_ms)
+                execution_phase_sweep_ms_values.append(exec_phase_sweep_ms)
+                execution_phase_retract_nudge_ms_values.append(exec_phase_retract_nudge_ms)
+                execution_phase_retract_pull_ms_values.append(exec_phase_retract_pull_ms)
+                execution_phase_return_to_rest_ms_values.append(exec_phase_return_to_rest_ms)
+                execution_phase_motion_total_excl_plan_ms_values.append(
+                    exec_phase_motion_total_excl_plan_ms
+                )
+                execution_phase_motion_total_incl_plan_ms_values.append(
+                    exec_phase_motion_total_incl_plan_ms
+                )
+                expansion_total_ms_values.append(total_ms)
+                expansion_prep_ms_values.append(prep_ms)
+                expansion_child_eval_ms_values.append(child_eval_ms)
+                expansion_child_action_gen_ms_values.append(child_action_generation_ms)
+                expansion_artifact_io_ms_values.append(artifact_io_ms)
+                reject_reason_counts[reject_reason] = int(reject_reason_counts.get(reject_reason, 0) + 1)
+                expansion_timing_rows.append(
+                    {
+                        "expansion": int(expansions),
+                        "parent_node_id": int(node_id),
+                        "child_node_id": None,
+                        "parent_depth": int(node.depth),
+                        "rejected": True,
+                        "rejected_reason": str(reject_reason),
+                        "selected_is_target_push": bool(executed_action.meta.get("is_target_push", False)),
+                        "execution_steps": int(exec_result.steps_executed),
+                        "timing_ms": timing_ms,
+                        "execution_timing_ms": {
+                            "executor_internal_total": exec_internal_total_ms,
+                            "phase": {
+                                "stage_plan": exec_phase_stage_plan_ms,
+                                "stage_execute": exec_phase_stage_execute_ms,
+                                "entry_move": exec_phase_entry_ms,
+                                "sweep_move": exec_phase_sweep_ms,
+                                "retract_nudge": exec_phase_retract_nudge_ms,
+                                "retract_pull": exec_phase_retract_pull_ms,
+                                "return_to_rest": exec_phase_return_to_rest_ms,
+                                "motion_total_excluding_stage_plan": (
+                                    exec_phase_motion_total_excl_plan_ms
+                                ),
+                                "motion_total_including_stage_plan": (
+                                    exec_phase_motion_total_incl_plan_ms
+                                ),
+                            },
+                        },
+                    }
+                )
                 continue
 
             scene_after = self.state_provider.get_scene_state(self.env)
@@ -474,16 +764,32 @@ class StickPushRecedingHorizonSearch:
                 "num_feasible_actions": 0,
                 "wavefront_used": bool(self.cfg.sampling.use_wavefront_insertion_solver),
                 "wavefront_cache_hit": False,
+                "action_cache_hit": False,
                 "rejected_infeasible_insertion": 0,
+                "num_insertion_checks": 0,
+                "num_insertion_solved": 0,
+                "timing_ms": {
+                    "total": 0.0,
+                    "sampling": 0.0,
+                    "wavefront_build": 0.0,
+                    "insertion_filter": 0.0,
+                    "insertion_solver_only": 0.0,
+                    "cache_clone": 0.0,
+                    "shuffle": 0.0,
+                },
             }
+            child_actions_built = False
             if not child_metrics.solved and child_depth < self.cfg.max_depth:
                 if (not self.cfg.prune_target_invalid_nodes) or child_goal_diag["target_shift_ok"]:
                     child_state_hash = hash_scene_state(scene_after)
+                    t_child_action_gen_ns = time.perf_counter_ns()
                     child_actions, child_action_diag = self._build_node_actions(
                         scene_after,
                         state_hash=child_state_hash,
                         rng=rng,
                     )
+                    child_action_generation_ms = _elapsed_ms(t_child_action_gen_ns)
+                    child_actions_built = True
                 else:
                     child_state_hash = hash_scene_state(scene_after)
             else:
@@ -506,6 +812,13 @@ class StickPushRecedingHorizonSearch:
             )
             nodes[child_id] = child_node
             node.child_ids.append(child_id)
+            if child_actions_built:
+                _record_action_generation(
+                    stage="child",
+                    node_id=child_id,
+                    depth=child_depth,
+                    diagnostics=child_action_diag,
+                )
 
             reward = progress_reward(
                 node.metrics,
@@ -513,11 +826,13 @@ class StickPushRecedingHorizonSearch:
                 solved_bonus=self.cfg.ucb.solved_bonus,
             )
             self._backprop(nodes, node_id, reward)
+            child_eval_ms = _elapsed_ms(t_child_eval_ns)
 
             expansions += 1
             executions += 1
             exp_dir = artifacts / f"exp_{expansions:06d}"
 
+            t_artifact_io_ns = time.perf_counter_ns()
             after_frame = capture_rgb_frame(self.env)
             if self.cfg.visual.save_expansion_images:
                 save_image(exp_dir / "before.png", before_frame)
@@ -565,15 +880,92 @@ class StickPushRecedingHorizonSearch:
                     exp_dir / "frontier.csv",
                     self._frontier_rows(nodes),
                 )
+            artifact_io_ms = _elapsed_ms(t_artifact_io_ns)
+            total_ms = _elapsed_ms(t_expansion_ns)
+            timing_ms = {
+                "frontier_expandable_scan": frontier_expandable_scan_ms,
+                "frontier_select": frontier_select_ms,
+                "prep": prep_ms,
+                "execute": exec_ms,
+                "child_eval": child_eval_ms,
+                "child_action_generation": child_action_generation_ms,
+                "artifact_io": artifact_io_ms,
+                "total": total_ms,
+            }
+            frontier_expandable_scan_ms_values.append(frontier_expandable_scan_ms)
+            frontier_select_ms_values.append(frontier_select_ms)
+            frontier_candidate_count_values.append(float(frontier_candidate_count))
+            execution_ms_values.append(exec_ms)
+            execution_internal_total_ms_values.append(exec_internal_total_ms)
+            execution_phase_stage_plan_ms_values.append(exec_phase_stage_plan_ms)
+            execution_phase_stage_execute_ms_values.append(exec_phase_stage_execute_ms)
+            execution_phase_entry_ms_values.append(exec_phase_entry_ms)
+            execution_phase_sweep_ms_values.append(exec_phase_sweep_ms)
+            execution_phase_retract_nudge_ms_values.append(exec_phase_retract_nudge_ms)
+            execution_phase_retract_pull_ms_values.append(exec_phase_retract_pull_ms)
+            execution_phase_return_to_rest_ms_values.append(exec_phase_return_to_rest_ms)
+            execution_phase_motion_total_excl_plan_ms_values.append(
+                exec_phase_motion_total_excl_plan_ms
+            )
+            execution_phase_motion_total_incl_plan_ms_values.append(
+                exec_phase_motion_total_incl_plan_ms
+            )
+            expansion_total_ms_values.append(total_ms)
+            expansion_prep_ms_values.append(prep_ms)
+            expansion_child_eval_ms_values.append(child_eval_ms)
+            expansion_child_action_gen_ms_values.append(child_action_generation_ms)
+            expansion_artifact_io_ms_values.append(artifact_io_ms)
+            expansion_timing_rows.append(
+                {
+                    "expansion": int(expansions),
+                    "parent_node_id": int(node_id),
+                    "child_node_id": int(child_id),
+                    "parent_depth": int(node.depth),
+                    "child_depth": int(child_depth),
+                    "rejected": False,
+                    "rejected_reason": None,
+                    "selected_is_target_push": bool(executed_action.meta.get("is_target_push", False)),
+                    "execution_steps": int(exec_result.steps_executed),
+                    "timing_ms": timing_ms,
+                    "execution_timing_ms": {
+                        "executor_internal_total": exec_internal_total_ms,
+                        "phase": {
+                            "stage_plan": exec_phase_stage_plan_ms,
+                            "stage_execute": exec_phase_stage_execute_ms,
+                            "entry_move": exec_phase_entry_ms,
+                            "sweep_move": exec_phase_sweep_ms,
+                            "retract_nudge": exec_phase_retract_nudge_ms,
+                            "retract_pull": exec_phase_retract_pull_ms,
+                            "return_to_rest": exec_phase_return_to_rest_ms,
+                            "motion_total_excluding_stage_plan": (
+                                exec_phase_motion_total_excl_plan_ms
+                            ),
+                            "motion_total_including_stage_plan": (
+                                exec_phase_motion_total_incl_plan_ms
+                            ),
+                        },
+                    },
+                    "child_action_generation": {
+                        "num_sampled_actions": int(child_action_diag.get("num_sampled_actions", 0)),
+                        "num_feasible_actions": int(child_action_diag.get("num_feasible_actions", 0)),
+                        "rejected_infeasible_insertion": int(child_action_diag.get("rejected_infeasible_insertion", 0)),
+                        "action_cache_hit": bool(child_action_diag.get("action_cache_hit", False)),
+                        "wavefront_cache_hit": bool(child_action_diag.get("wavefront_cache_hit", False)),
+                        "timing_ms": dict(child_action_diag.get("timing_ms", {})),
+                    },
+                }
+            )
 
             if child_metrics.solved:
                 solved_node_id = child_id
                 break
+        search_loop_ms = _elapsed_ms(t_search_loop_ns)
 
         best_node_id = solved_node_id if solved_node_id is not None else self._best_node_id(nodes)
         plan_actions, plan_metrics, plan_node_ids = self._recover_chain(nodes, best_node_id)
 
         # Final replay from root for deterministic verification video.
+        t_replay_ns = time.perf_counter_ns()
         replay_frames = []
         self.raw.set_state(root_state.clone())
         replay_frames.append(capture_rgb_frame(self.env))
@@ -587,6 +979,62 @@ class StickPushRecedingHorizonSearch:
             replay_frames.append(capture_rgb_frame(self.env))
 
         save_video(artifacts / "final_replay.mp4", replay_frames, fps=20)
+        replay_video_ms = _elapsed_ms(t_replay_ns)
+
+        timing_summary = {
+            "run_total_ms": _elapsed_ms(t_run_ns),
+            "search_loop_ms": search_loop_ms,
+            "root_artifact_io_ms": root_artifact_io_ms,
+            "replay_video_ms": replay_video_ms,
+            "action_generation_calls": int(len(action_gen_rows)),
+            "action_generation_action_cache_hits": int(action_gen_cache_hits),
+            "action_generation_wavefront_cache_hits": int(action_gen_wavefront_cache_hits),
+            "action_generation_ms": {
+                "total": _stats_ms(action_gen_total_ms),
+                "sampling": _stats_ms(action_gen_sampling_ms),
+                "wavefront_build": _stats_ms(action_gen_wavefront_build_ms),
+                "insertion_filter": _stats_ms(action_gen_insertion_filter_ms),
+                "insertion_solver_only": _stats_ms(action_gen_insertion_solver_ms),
+                "cache_clone": _stats_ms(action_gen_cache_clone_ms),
+                "shuffle": _stats_ms(action_gen_shuffle_ms),
+            },
+            "expansion_ms": {
+                "total": _stats_ms(expansion_total_ms_values),
+                "frontier_expandable_scan": _stats_ms(frontier_expandable_scan_ms_values),
+                "frontier_select": _stats_ms(frontier_select_ms_values),
+                "frontier_candidate_count": _stats_scalar(frontier_candidate_count_values),
+                "prep": _stats_ms(expansion_prep_ms_values),
+                "execute": _stats_ms(execution_ms_values),
+                "execute_internal_total": _stats_ms(execution_internal_total_ms_values),
+                "child_eval": _stats_ms(expansion_child_eval_ms_values),
+                "child_action_generation": _stats_ms(expansion_child_action_gen_ms_values),
+                "artifact_io": _stats_ms(expansion_artifact_io_ms_values),
+            },
+            "execution_phase_ms": {
+                "stage_plan": _stats_ms(execution_phase_stage_plan_ms_values),
+                "stage_execute": _stats_ms(execution_phase_stage_execute_ms_values),
+                "entry_move": _stats_ms(execution_phase_entry_ms_values),
+                "sweep_move": _stats_ms(execution_phase_sweep_ms_values),
+                "retract_nudge": _stats_ms(execution_phase_retract_nudge_ms_values),
+                "retract_pull": _stats_ms(execution_phase_retract_pull_ms_values),
+                "return_to_rest": _stats_ms(execution_phase_return_to_rest_ms_values),
+                "motion_total_excluding_stage_plan": _stats_ms(
+                    execution_phase_motion_total_excl_plan_ms_values
+                ),
+                "motion_total_including_stage_plan": _stats_ms(
+                    execution_phase_motion_total_incl_plan_ms_values
+                ),
+            },
+            "reject_reason_counts": reject_reason_counts,
+        }
+        save_json(
+            artifacts / "timing_diagnostics.json",
+            {
+                "timing_summary": timing_summary,
+                "action_generation": action_gen_rows,
+                "expansions": expansion_timing_rows,
+            },
+        )
 
         save_json(
             artifacts / "final_plan.json",
@@ -610,6 +1058,7 @@ class StickPushRecedingHorizonSearch:
             "artifact_dir": str(artifacts),
             "root_metrics": serialize_metrics(root_metrics),
             "best_metrics": serialize_metrics(nodes[best_node_id].metrics),
+            "timing": timing_summary,
         }
         save_json(artifacts / "summary.json", summary)
 

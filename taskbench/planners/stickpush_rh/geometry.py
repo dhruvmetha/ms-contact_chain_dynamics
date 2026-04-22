@@ -180,6 +180,95 @@ def compute_node_metrics(scene: SceneState, clearance_radius: float, pushes_used
     )
 
 
+def segment_intersects_front_semicircle(
+    seg_a_xy: np.ndarray,
+    seg_b_xy: np.ndarray,
+    target: ObjectState,
+    clearance_radius: float,
+    open_dir_xy: np.ndarray,
+    *,
+    eps: float = 1e-9,
+) -> bool:
+    """Whether a line segment intersects the target front semicircle region."""
+
+    a = np.asarray(seg_a_xy, dtype=np.float64).reshape(2)
+    b = np.asarray(seg_b_xy, dtype=np.float64).reshape(2)
+    center = np.asarray(grasp_semicircle_center_xy(target, open_dir_xy), dtype=np.float64)
+    u = np.asarray(normalize_xy(open_dir_xy), dtype=np.float64)
+    r = float(clearance_radius)
+
+    # p(t) = a + t*(b-a), t in [0,1]
+    d = b - a
+    q = a - center
+    A = float(np.dot(d, d))
+
+    # Degenerate segment: check endpoint directly.
+    if A <= eps:
+        in_disk = float(np.linalg.norm(q)) <= r + eps
+        in_front = float(np.dot(q, u)) >= -eps
+        return bool(in_disk and in_front)
+
+    # Disk constraint: ||q + t d||^2 <= r^2
+    B = float(2.0 * np.dot(d, q))
+    C = float(np.dot(q, q) - r * r)
+    disc = float(B * B - 4.0 * A * C)
+    if disc < -eps:
+        return False
+    if disc < 0.0:
+        disc = 0.0
+    s = math.sqrt(disc)
+    t0 = float((-B - s) / (2.0 * A))
+    t1 = float((-B + s) / (2.0 * A))
+    disk_lo = max(0.0, min(t0, t1))
+    disk_hi = min(1.0, max(t0, t1))
+    if disk_hi < disk_lo - eps:
+        return False
+
+    # Front-half constraint: dot(q + t d, u) >= 0
+    L = float(np.dot(d, u))
+    M = float(np.dot(q, u))
+    front_lo = 0.0
+    front_hi = 1.0
+    if abs(L) <= eps:
+        if M < -eps:
+            return False
+    elif L > 0.0:
+        front_lo = max(front_lo, float(-M / L))
+    else:
+        front_hi = min(front_hi, float(-M / L))
+    if front_hi < front_lo - eps:
+        return False
+
+    lo = max(disk_lo, front_lo)
+    hi = min(disk_hi, front_hi)
+    return bool(hi >= lo - eps)
+
+
+def front_semicircle_wall_intersections(scene: SceneState, clearance_radius: float) -> list[str]:
+    """Return side/back shelf walls intersecting the target front semicircle."""
+
+    fx = float(scene.shelf_front_x)
+    bx = float(scene.shelf_back_x)
+    hw = float(scene.shelf_half_w)
+    segments = {
+        "side_pos": (np.array([fx, hw], dtype=np.float64), np.array([bx, hw], dtype=np.float64)),
+        "side_neg": (np.array([fx, -hw], dtype=np.float64), np.array([bx, -hw], dtype=np.float64)),
+        "back": (np.array([bx, -hw], dtype=np.float64), np.array([bx, hw], dtype=np.float64)),
+    }
+
+    hits: list[str] = []
+    for name, (a, b) in segments.items():
+        if segment_intersects_front_semicircle(
+            a,
+            b,
+            scene.target,
+            clearance_radius,
+            scene.open_dir_xy,
+        ):
+            hits.append(name)
+    return hits
+
+
 def hash_scene_state(scene: SceneState, quantization: float = 0.005) -> str:
     """Hash active object XY positions for loop detection/diagnostics."""
 
