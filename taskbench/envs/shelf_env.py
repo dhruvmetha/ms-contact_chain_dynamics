@@ -71,6 +71,7 @@ class ShelfTaskConfig:
     robot_uids: str = "panda"
     robot_base_pose: list[float] = field(default_factory=lambda: [-0.615, 0.0, 0.0])
     num_objects: int = 20
+    active_object_count: int | None = None
     shelf: ShelfGeometry = field(default_factory=ShelfGeometry)
     cylinder: CylinderSpec = field(default_factory=CylinderSpec)
 
@@ -89,11 +90,29 @@ class ShelfEnv(TaskEnv):
 
     SUPPORTED_REWARD_MODES = ["none"]
 
-    def __init__(self, *args, robot_uids="panda", num_objects: int = 20,
-                 shelf=None, cylinder=None, open_top: bool = False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        robot_uids="panda",
+        num_objects: int = 20,
+        active_object_count: int | None = None,
+        shelf=None,
+        cylinder=None,
+        open_top: bool = False,
+        **kwargs,
+    ):
         self.shelf_geom = ShelfGeometry(**(shelf or {}))
         self.cyl_spec = CylinderSpec(**(cylinder or {}))
-        self.num_objects = num_objects
+        self.num_objects = int(num_objects)
+        if active_object_count is None:
+            self.active_object_count = None
+        else:
+            count = int(active_object_count)
+            if count < 1 or count > self.num_objects:
+                raise ValueError(
+                    f"active_object_count must be in [1, {self.num_objects}], got {count}."
+                )
+            self.active_object_count = count
         self.open_top = open_top
         self.target_idx = 0
         super().__init__(
@@ -245,7 +264,13 @@ class ShelfEnv(TaskEnv):
             r = self.cyl_spec.radius
             hl = self.cyl_spec.half_length
             rng0 = self._batched_episode_rng[0]
-            self.target_idx = int(rng0.randint(0, self.num_objects))
+            target_pool = (
+                int(self.active_object_count)
+                if self.active_object_count is not None
+                else int(self.num_objects)
+            )
+            target_pool = max(1, min(target_pool, int(self.num_objects)))
+            self.target_idx = int(rng0.randint(0, target_pool))
             for i in range(self.num_objects):
                 color = RED_COLOR if i == self.target_idx else BLUE_COLOR
                 cyl_mat = sapien.render.RenderMaterial(base_color=color)
@@ -279,11 +304,15 @@ class ShelfEnv(TaskEnv):
         env_idx_np = env_idx.detach().cpu().numpy()
         rng = self._batched_episode_rng[env_idx_np]
 
-        # Random cylinder count per env (1..num_objects), sampled from the
-        # ManiSkill episode RNG so repeated reset(seed=...) is deterministic.
+        if self.active_object_count is not None:
+            # Fixed active-count mode for deterministic benchmarking/testing.
+            counts_np = np.full((b,), int(self.active_object_count), dtype=np.int32)
+        else:
+            # Random cylinder count per env (1..num_objects), sampled from the
+            # ManiSkill episode RNG so repeated reset(seed=...) is deterministic.
+            counts_np = rng.randint(1, self.num_objects + 1)
+            counts_np = np.asarray(counts_np, dtype=np.int32).reshape(b)
         # Ensure target is active.
-        counts_np = rng.randint(1, self.num_objects + 1)
-        counts_np = np.asarray(counts_np, dtype=np.int32).reshape(b)
         counts_np = np.maximum(counts_np, self.target_idx + 1)
         counts = torch.from_numpy(counts_np).to(device=self.device, dtype=torch.int64)
 

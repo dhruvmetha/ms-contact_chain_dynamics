@@ -1,0 +1,52 @@
+# YAML config for generating a ShelfEnv-v1 scene bank used by stickpush RH
+# heuristic tests.
+#
+# Run:
+#   uv run python scripts/generate_stickpush_rh_scene_bank.py \
+#     --config configs/solver/shelf_stickpush_rh_scene_bank.yaml
+#
+# Optional overrides:
+#   uv run python scripts/generate_stickpush_rh_scene_bank.py \
+#     --config configs/solver/shelf_stickpush_rh_scene_bank.yaml \
+#     --set scene_bank.active_object_count=10 \
+#     --set scene_bank.num_scenes_if_fast=50
+
+scene_bank:
+  env_id: ShelfEnv-v1
+  sim_backend: cpu
+  robot_uid: panda_stick_long
+  robot_base_pose: [-0.4, 0.15, 0.0, 1.0, 0.0, 0.0, 0.0]
+  obs_mode: state
+  reward_mode: none
+  control_mode: pd_joint_pos
+  render_mode: rgb_array
+
+  # Scene composition knobs
+  num_objects: 20
+  active_object_count: 13
+  filter_active_object_count: 13
+  require_unique_state_hash: true
+
+  # Optional shelf/cylinder overrides. Keep defaults unless you want a custom task geometry.
+  shelf:
+    front_x: 0.20
+    depth: 0.30
+    half_w: 0.25
+    floor_z: 0.30
+    thickness: 0.01
+    inner_h: 0.25
+  cylinder:
+    radius: 0.018
+    half_length: 0.045
+
+  # Sampling and auto-size policy
+  reference_seed: 0
+  seed_start: 0
+  max_seed: 200000
+  benchmark_trials: 100
+  slow_threshold_sec: 60.0
+  num_scenes_if_fast: 100
+  num_scenes_if_slow: 10
+
+  # Output path (kept inside stickpush RH planner test-data, not artifacts)
+  out_path: taskbench/planners/stickpush_rh/test_data/scene_bank_shelf_env_v1_seed0_active13_n100.json

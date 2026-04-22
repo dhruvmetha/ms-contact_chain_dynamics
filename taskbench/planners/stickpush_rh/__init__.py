@@ -25,6 +25,12 @@ from taskbench.planners.stickpush_rh.search import (
     PlannerRunResult,
     StickPushRecedingHorizonSearch,
 )
+from taskbench.planners.stickpush_rh.scene_bank import (
+    DEFAULT_SCENE_BANK_PATH,
+    load_scene_bank_payload,
+    load_scene_bank_states,
+    payload_scene_to_state,
+)
 from taskbench.planners.stickpush_rh.state_provider import GTSceneStateProvider
 from taskbench.planners.stickpush_rh.types import (
     NodeMetrics,
@@ -51,6 +57,7 @@ __all__ = [
     "SceneStateProvider",
     "SearchNode",
     "SamplingConfig",
+    "DEFAULT_SCENE_BANK_PATH",
     "StickPushExecutor",
     "WavefrontGrid",
     "UCBConfig",
@@ -58,5 +65,8 @@ __all__ = [
     "PlannerRunResult",
     "StickPushRecedingHorizonSearch",
     "build_wavefront_grid",
+    "load_scene_bank_payload",
+    "load_scene_bank_states",
+    "payload_scene_to_state",
     "solve_straight_insertion",
 ]
