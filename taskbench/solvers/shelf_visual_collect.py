@@ -53,12 +53,18 @@ logger = logging.getLogger("taskbench.solvers.shelf_visual_collect")
 DEFAULT_CAMERA_NAMES = ["top_camera"]
 
 
-def _sample_pushes_mixed(rng, N, shelf, cylinder_positions, radius=0.05):
+def _sample_pushes_mixed(rng, N, shelf, cylinder_positions, radius=0.05,
+                         cyl_radius=0.018, stick_radius=0.005,
+                         insert_buffer=0.005):
     """Sample pushes with three strategies (1/3 each):
 
     1. p1 within `radius` of a random cylinder, p2 random
     2. p1 random, p2 within `radius` of a random cylinder
     3. Fully random (no bias)
+
+    p1 is guaranteed to lie on a clear straight-line insertion corridor:
+    no active cylinder lies on the +X path from (front_x - 0.05, p1_y, p1_z)
+    to p1 within (cyl_radius + stick_radius + insert_buffer) in y.
 
     Args:
         rng: numpy random generator
@@ -67,33 +73,78 @@ def _sample_pushes_mixed(rng, N, shelf, cylinder_positions, radius=0.05):
         cylinder_positions: (N, max_cyl, 3) array of cylinder positions
             (hidden cylinders have x > 2.0)
         radius: jitter radius around cylinder center (meters)
+        cyl_radius: cylinder body radius (meters)
+        stick_radius: push stick radius (meters)
+        insert_buffer: extra clearance on top of (cyl_r + stick_r) (meters)
+
+    Returns:
+        p1: (N, 3) entry positions
+        p2: (N, 3) sweep endpoints
+        clear_mask: (N,) bool — True if p1 has a clear insertion path. Envs
+            with False should be excluded from the dataset (200-try cap fired).
     """
     # Start with fully random pushes
     p1, p2 = _sample_pushes(rng, N, shelf)
+
+    margin = 0.02
+    y_clearance = cyl_radius + stick_radius + insert_buffer
+    x_pad = cyl_radius + stick_radius + insert_buffer  # cylinder past p1
+    approach_x = shelf["front_x"] - 0.05
+    x_back = approach_x - stick_radius
+
+    def _insertion_clear(pt_xy, cyls_xy_active):
+        """True iff the +X insertion corridor at y=pt_xy[1] up to x=pt_xy[0]
+        is free of every active cylinder."""
+        if len(cyls_xy_active) == 0:
+            return True
+        cx = cyls_xy_active[:, 0]
+        cy = cyls_xy_active[:, 1]
+        in_y_band = np.abs(cy - pt_xy[1]) < y_clearance
+        in_x_range = (cx >= x_back) & (cx <= pt_xy[0] + x_pad)
+        return not bool((in_y_band & in_x_range).any())
+
+    clear_mask = np.zeros(N, dtype=bool)
 
     for i in range(N):
         strategy = rng.random()
         cyls = cylinder_positions[i]  # (max_cyl, 3)
         active = cyls[:, 0] < 2.0
-        if not active.any():
-            continue  # no cylinders, keep random
+        active_xy = cyls[active, :2]
 
-        # Pick a random active cylinder
-        cyl_idx = rng.choice(np.where(active)[0])
-        cyl_pos = cyls[cyl_idx]
+        # Ensure the initial random p1 has a clear insertion corridor;
+        # if not, resample p1 uniformly in-shelf.
+        if not _insertion_clear(p1[i, :2], active_xy):
+            for _ in range(200):
+                p1[i, 0] = rng.uniform(shelf["front_x"] + margin,
+                                        shelf["front_x"] + shelf["depth"] - margin)
+                p1[i, 1] = rng.uniform(-shelf["half_w"] + margin,
+                                        shelf["half_w"] - margin)
+                if _insertion_clear(p1[i, :2], active_xy):
+                    break
 
-        margin = 0.02
-        if strategy < 0.25:
-            # Strategy 1: p1 near cylinder, p2 random
-            p1[i, 0] = cyl_pos[0] + rng.uniform(-radius, radius)
-            p1[i, 1] = cyl_pos[1] + rng.uniform(-radius, radius)
-            # Clamp to shelf bounds
-            p1[i, 0] = np.clip(p1[i, 0], shelf["front_x"] + margin,
-                                shelf["front_x"] + shelf["depth"] - margin)
-            p1[i, 1] = np.clip(p1[i, 1], -shelf["half_w"] + margin,
-                                shelf["half_w"] - margin)
-        elif strategy < 0.50:
-            # Strategy 2: p1 random, p2 near cylinder
+        if active.any() and strategy < 0.25:
+            # Strategy 1: p1 near a chosen cylinder but with clear corridor.
+            cyl_idx = rng.choice(np.where(active)[0])
+            cyl_pos = cyls[cyl_idx]
+            for _ in range(200):
+                cand = np.array([
+                    cyl_pos[0] + rng.uniform(-radius, radius),
+                    cyl_pos[1] + rng.uniform(-radius, radius),
+                ])
+                cand[0] = np.clip(cand[0], shelf["front_x"] + margin,
+                                   shelf["front_x"] + shelf["depth"] - margin)
+                cand[1] = np.clip(cand[1], -shelf["half_w"] + margin,
+                                   shelf["half_w"] - margin)
+                if _insertion_clear(cand, active_xy):
+                    p1[i, 0] = cand[0]
+                    p1[i, 1] = cand[1]
+                    break
+            # If we never found a clear cand, keep the pre-checked p1
+            # (still corridor-clear from the block above).
+        elif active.any() and strategy < 0.50:
+            # Strategy 2: p1 stays where it is, p2 jitters near a cylinder.
+            cyl_idx = rng.choice(np.where(active)[0])
+            cyl_pos = cyls[cyl_idx]
             p2[i, 0] = cyl_pos[0] + rng.uniform(-radius, radius)
             p2[i, 1] = cyl_pos[1] + rng.uniform(-radius, radius)
             p2[i, 0] = np.clip(p2[i, 0], shelf["front_x"] + margin,
@@ -110,7 +161,50 @@ def _sample_pushes_mixed(rng, N, shelf, cylinder_positions, radius=0.05):
                                     shelf["half_w"] - margin)
             p2[i, 2] = p1[i, 2]
 
-    return p1, p2
+        clear_mask[i] = _insertion_clear(p1[i, :2], active_xy)
+
+    return p1, p2, clear_mask
+
+
+def _scene_validity_masks(cyl_pos, cyl_quat, shelf_geom, tilt_cos=0.5):
+    """Vectorized scene-validity check across N envs and num_cyl cylinders.
+
+    NB: cylinders in this env are spawned via CYL_UPRIGHT_Q which aligns the
+    cylinder's BODY +X axis with world +Z (i.e. the height axis is body-X,
+    not body-Z). So upright-ness is measured by the world-z component of the
+    body x-axis: `2*(qx*qz + qw*qy)`. For CYL_UPRIGHT_Q this is 1.0; for a
+    cylinder lying on its side it's 0.
+
+    Args:
+        cyl_pos: (N, num_cyl, 3) cylinder positions (hidden cyl: x > 2.0)
+        cyl_quat: (N, num_cyl, 4) cylinder quaternions in (qw, qx, qy, qz)
+        shelf_geom: object with attrs front_x, back_x, half_w, surface_z
+        tilt_cos: minimum world-z component of body x-axis (cos(60°) = 0.5)
+
+    Returns:
+        valid: (N,) bool — True iff every active cylinder is in shelf bounds
+            and upright. An env with no active cylinders is valid by default.
+    """
+    g = shelf_geom
+    active = cyl_pos[..., 0] < 2.0  # (N, num_cyl)
+    off_shelf = (
+        (cyl_pos[..., 0] < g.front_x - 0.02)
+        | (cyl_pos[..., 0] > g.back_x + 0.02)
+        | (cyl_pos[..., 1] < -g.half_w - 0.02)
+        | (cyl_pos[..., 1] > g.half_w + 0.02)
+        | (cyl_pos[..., 2] < g.surface_z - 0.01)
+    )
+    qw, qx, qy, qz = (
+        cyl_quat[..., 0], cyl_quat[..., 1],
+        cyl_quat[..., 2], cyl_quat[..., 3],
+    )
+    # |R[2,0]| = |2(qx*qz - qw*qy)| — magnitude of world-z projection of
+    # body-x. Use abs() because the spawn rotation aligns body-X with -world-Z;
+    # a flipped cylinder (body-X = +world-Z) is equally upright.
+    body_x_world_z = np.abs(2.0 * (qx * qz - qw * qy))
+    toppled = body_x_world_z < tilt_cos
+    bad = active & (off_shelf | toppled)
+    return ~bad.any(axis=1)  # (N,)
 
 
 def _extract_frame(obs, camera_name, env_indices, device="cpu"):
@@ -465,7 +559,7 @@ class ShelfVisualCollectSolver(BaseSolver):
                 actor.pose.p.cpu().numpy()
                 for actor in raw.get_objects().values()
             ], axis=1)  # (N, num_cyl, 3)
-            p1_np, p2_np = _sample_pushes_mixed(
+            p1_np, p2_np, clear_mask = _sample_pushes_mixed(
                 push_rng, N, shelf_dict, cyl_pos
             )
             approach_np = np.stack(
@@ -485,21 +579,11 @@ class ShelfVisualCollectSolver(BaseSolver):
                 for actor in raw.get_objects().values()
             ], axis=1)  # (N, num_cyl, 4)
 
-            pre_valid = np.ones(len(collect_indices), dtype=bool)
-            for ci, eidx in enumerate(collect_indices):
-                for cyl_i in range(cyl_pos_before.shape[1]):
-                    cp = cyl_pos_before[eidx, cyl_i]
-                    cq = cyl_quat_before[eidx, cyl_i]
-                    if cp[0] > 2.0:
-                        continue
-                    if (cp[0] < g.front_x - 0.02 or cp[0] > g.back_x + 0.02
-                            or cp[1] < -g.half_w - 0.02 or cp[1] > g.half_w + 0.02
-                            or cp[2] < g.surface_z - 0.01):
-                        pre_valid[ci] = False
-                        break
-                    if abs(cq[0]) < 0.5:
-                        pre_valid[ci] = False
-                        break
+            # Vectorized pre-push scene validity (off-shelf + toppled).
+            scene_ok_pre = _scene_validity_masks(
+                cyl_pos_before, cyl_quat_before, g
+            )
+            pre_valid = clear_mask[collect_indices] & scene_ok_pre[collect_indices]
 
             # Capture "before" frame
             obs_before = env.step(rest)[0]
@@ -554,25 +638,11 @@ class ShelfVisualCollectSolver(BaseSolver):
                 for actor in raw.get_objects().values()
             ], axis=1)  # (N, num_cyl, 4)
 
-            valid_mask = pre_valid.copy()
-            for ci, eidx in enumerate(collect_indices):
-                for cyl_i in range(cyl_pos_after.shape[1]):
-                    cp = cyl_pos_after[eidx, cyl_i]
-                    cq = cyl_quat_after[eidx, cyl_i]
-                    if cp[0] > 2.0:
-                        continue  # hidden cylinder, skip
-                    # Check: inside shelf bounds (with margin)
-                    if (cp[0] < g.front_x - 0.02 or cp[0] > g.back_x + 0.02
-                            or cp[1] < -g.half_w - 0.02 or cp[1] > g.half_w + 0.02
-                            or cp[2] < g.surface_z - 0.01):
-                        valid_mask[ci] = False
-                        break
-                    # Check: upright (w component of quaternion close to ±0.707
-                    # for a cylinder standing on its end, z-axis aligned)
-                    # Upright quaternion has |qw| > 0.5 (within ~60° of vertical)
-                    if abs(cq[0]) < 0.5:
-                        valid_mask[ci] = False
-                        break
+            # Vectorized post-push scene validity.
+            scene_ok_post = _scene_validity_masks(
+                cyl_pos_after, cyl_quat_after, g
+            )
+            valid_mask = pre_valid & scene_ok_post[collect_indices]
 
             n_valid = valid_mask.sum()
             if n_valid > 0:
@@ -590,14 +660,16 @@ class ShelfVisualCollectSolver(BaseSolver):
             total_success += n_ok
             total_pushes += N
             n_rejected = len(collect_indices) - n_valid
+            n_blocked = int((~clear_mask[collect_indices]).sum())
 
             logger.info(
-                "Push %d/%d: %d/%d success, %d rejected (toppled/off-shelf), zarr total: %d samples",
+                "Push %d/%d: %d/%d success, %d rejected (toppled/off-shelf/blocked, %d blocked-insertion), zarr total: %d samples",
                 push_idx + 1,
                 self.pushes_per_episode,
                 n_ok,
                 N,
                 n_rejected,
+                n_blocked,
                 self._zarr_count,
             )
 
@@ -637,7 +709,7 @@ class ShelfVisualCollectSolver(BaseSolver):
                 actor.pose.p.cpu().numpy()
                 for actor in raw.get_objects().values()
             ], axis=1)  # (N, num_cyl, 3)
-            p1_np, p2_np = _sample_pushes_mixed(
+            p1_np, p2_np, clear_mask = _sample_pushes_mixed(
                 push_rng, N, shelf_dict, cyl_pos
             )
             approach_np = np.stack(
@@ -673,6 +745,14 @@ class ShelfVisualCollectSolver(BaseSolver):
                 sensor_params = obs.get("sensor_param", {})
                 if not sensor_data:
                     return
+                # Batched GPU→CPU: one transfer per tensor instead of one per env.
+                qpos_np = raw.agent.robot.get_qpos().cpu().numpy()      # (N, dof)
+                tcp_p_np = raw.agent.tcp.pose.p.cpu().numpy()           # (N, 3)
+                tcp_q_np = raw.agent.tcp.pose.q.cpu().numpy()           # (N, 4)
+                obj_pq = {
+                    name: (actor.pose.p.cpu().numpy(), actor.pose.q.cpu().numpy())
+                    for name, actor in raw.get_objects().items()
+                }
                 for eidx in collect_envs:
                     vs, md = push_streams[eidx]
                     for cam in camera_names:
@@ -681,22 +761,12 @@ class ShelfVisualCollectSolver(BaseSolver):
                                 env, cam, sensor_data[cam],
                                 sensor_params, vs, md, env_idx=eidx,
                             )
-                    md["qpos"].append(
-                        raw.agent.robot.get_qpos()[eidx].cpu().numpy().copy()
-                    )
-                    md["tcp_pos"].append(
-                        raw.agent.tcp.pose.p[eidx].cpu().numpy().copy()
-                    )
-                    md["tcp_quat"].append(
-                        raw.agent.tcp.pose.q[eidx].cpu().numpy().copy()
-                    )
-                    for name, actor in raw.get_objects().items():
-                        md.setdefault(f"{name}_pos", []).append(
-                            actor.pose.p[eidx].cpu().numpy().copy()
-                        )
-                        md.setdefault(f"{name}_quat", []).append(
-                            actor.pose.q[eidx].cpu().numpy().copy()
-                        )
+                    md["qpos"].append(qpos_np[eidx].copy())
+                    md["tcp_pos"].append(tcp_p_np[eidx].copy())
+                    md["tcp_quat"].append(tcp_q_np[eidx].copy())
+                    for name, (p_np, q_np) in obj_pq.items():
+                        md.setdefault(f"{name}_pos", []).append(p_np[eidx].copy())
+                        md.setdefault(f"{name}_quat", []).append(q_np[eidx].copy())
 
             # Scale sweep steps: 200 base + extra for long sweeps
             # Each waypoint needs ~30 steps to converge, with 10 waypoints
@@ -742,35 +812,38 @@ class ShelfVisualCollectSolver(BaseSolver):
             ], axis=1)  # (N, num_cyl, 4)
 
             pos_thresh = self.interaction_pos_thresh
+            # Vectorized validity & interaction masks (shape (N,) each).
+            scene_ok_pre = _scene_validity_masks(
+                cyl_pos_before, cyl_quat_before, g
+            )
+            scene_ok_post = _scene_validity_masks(
+                cyl_pos_after, cyl_quat_after, g
+            )
+            active_pre = cyl_pos_before[..., 0] < 2.0  # (N, num_cyl)
+            has_active = active_pre.any(axis=1)
+            disp = np.linalg.norm(cyl_pos_after - cyl_pos_before, axis=-1)  # (N, num_cyl)
+            moved_any = (disp > pos_thresh) & active_pre
+            interaction = moved_any.any(axis=1)
 
             def _env_has_interaction(eidx):
-                active = cyl_pos_before[eidx, :, 0] < 2.0
-                if not active.any():
+                if not bool(clear_mask[eidx]):
+                    return False, "blocked_insertion"
+                if not bool(has_active[eidx]):
                     return False, "no_cyl"
-                # reject if any active cylinder ended toppled or off-shelf
-                for ci in np.where(active)[0]:
-                    cp = cyl_pos_after[eidx, ci]
-                    cq = cyl_quat_after[eidx, ci]
-                    if (cp[0] < g.front_x - 0.02 or cp[0] > g.back_x + 0.02
-                            or cp[1] < -g.half_w - 0.02
-                            or cp[1] > g.half_w + 0.02
-                            or cp[2] < g.surface_z - 0.01):
-                        return False, "off_shelf"
-                    if abs(cq[0]) < 0.5:
-                        return False, "toppled"
-                # require at least one active cylinder to have moved meaningfully
-                for ci in np.where(active)[0]:
-                    dp = np.linalg.norm(
-                        cyl_pos_after[eidx, ci] - cyl_pos_before[eidx, ci]
-                    )
-                    if dp > pos_thresh:
-                        return True, "ok"
-                return False, "no_interaction"
+                if not bool(scene_ok_pre[eidx]):
+                    return False, "bad_pre_state"
+                if not bool(scene_ok_post[eidx]):
+                    return False, "bad_post_state"
+                if not bool(interaction[eidx]):
+                    return False, "no_interaction"
+                return True, "ok"
 
             # Write trajectories
             n_written = 0
             n_empty = 0
             n_bad_state = 0
+            n_blocked = 0
+            n_bad_pre = 0
             for eidx in collect_envs:
                 vs, md = push_streams[eidx]
                 video_np = {
@@ -783,6 +856,12 @@ class ShelfVisualCollectSolver(BaseSolver):
                 if not ok:
                     if reason == "no_interaction":
                         n_empty += 1
+                    elif reason == "blocked_insertion":
+                        n_blocked += 1
+                    elif reason == "bad_pre_state":
+                        n_bad_pre += 1
+                    elif reason == "bad_post_state":
+                        n_bad_state += 1
                     else:
                         n_bad_state += 1
                     continue
@@ -813,7 +892,7 @@ class ShelfVisualCollectSolver(BaseSolver):
                 n_written += 1
 
             logger.info(
-                "Push %d/%d: %d/%d success, wrote %d (rej: %d empty, %d bad_state), total: %d",
+                "Push %d/%d: %d/%d success, wrote %d (rej: %d empty, %d bad_state, %d blocked, %d bad_pre), total: %d",
                 push_idx + 1,
                 self.pushes_per_episode,
                 n_ok,
@@ -821,6 +900,8 @@ class ShelfVisualCollectSolver(BaseSolver):
                 n_written,
                 n_empty,
                 n_bad_state,
+                n_blocked,
+                n_bad_pre,
                 self._traj_counter,
             )
 

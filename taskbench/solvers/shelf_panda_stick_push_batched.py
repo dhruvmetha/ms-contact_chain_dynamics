@@ -37,7 +37,9 @@ def _sample_pushes(rng, N, shelf):
     """Sample N random push targets."""
     margin, y_margin = 0.02, 0.04
     surface_z = shelf["floor_z"] + shelf["thickness"]
-    push_z = surface_z + 0.045
+    # Push below the cylinder COM (4.5cm) to reduce tipping torque while
+    # keeping margin above the shelf floor (stick radius = 5mm).
+    push_z = surface_z + 0.025
     max_x = shelf["front_x"] + shelf["depth"] - margin
 
     p1 = np.zeros((N, 3))
