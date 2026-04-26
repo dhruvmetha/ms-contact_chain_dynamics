@@ -14,9 +14,10 @@ Usage:
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Callable
 
+import numpy as np
 import torch
 
 from taskbench.skills.curobo_motion import (
@@ -39,6 +40,99 @@ class StickPushResult:
     retract_final_dist: torch.Tensor # (N,) float — distance to retract point
     orientation_drift: torch.Tensor  # (N,) float — max quat deviation from goal
     steps_executed: int              # total sim steps
+    trace_debug: Optional["StickPushTraceDebug"] = None
+
+
+@dataclass
+class StickPushPhaseLineMetrics:
+    """Per-phase projected-vs-actual line metrics."""
+    max_offtrack: torch.Tensor       # (N,)
+    final_offtrack: torch.Tensor     # (N,)
+    final_along_error: torch.Tensor  # (N,)
+    offtrack_violation: torch.Tensor  # (N,) bool
+
+
+@dataclass
+class StickPushPhaseTrace:
+    """Planned segment + actual TCP trace for one phase."""
+    phase: str
+    planned_start_xyz: torch.Tensor  # (N, 3)
+    planned_end_xyz: torch.Tensor    # (N, 3)
+    actual_trace_xyz: list[np.ndarray] = field(default_factory=list)  # len N, each (T_i, 3)
+    metrics: Optional[StickPushPhaseLineMetrics] = None
+
+
+@dataclass
+class StickPushTraceDebug:
+    """Debug payload with entry/sweep/retract trace geometry."""
+    entry: StickPushPhaseTrace
+    sweep: StickPushPhaseTrace
+    retract: StickPushPhaseTrace
+
+
+def _stack_trace_points(points: list[np.ndarray]) -> np.ndarray:
+    """Convert a list of 3D points to (T, 3) float32 array."""
+    if not points:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.stack(points, axis=0).astype(np.float32, copy=False)
+
+
+def _compute_segment_metrics(
+    *,
+    planned_start_xyz: torch.Tensor,
+    planned_end_xyz: torch.Tensor,
+    actual_trace_xyz: list[np.ndarray],
+    offtrack_threshold: float,
+) -> StickPushPhaseLineMetrics:
+    """Project traces onto planned segments and compute off-track metrics."""
+    n_envs = int(planned_start_xyz.shape[0])
+    max_offtrack = np.zeros(n_envs, dtype=np.float32)
+    final_offtrack = np.zeros(n_envs, dtype=np.float32)
+    final_along_error = np.zeros(n_envs, dtype=np.float32)
+    offtrack_violation = np.zeros(n_envs, dtype=bool)
+
+    start_np = planned_start_xyz.detach().cpu().numpy()
+    end_np = planned_end_xyz.detach().cpu().numpy()
+    eps = 1e-8
+
+    for env_i in range(n_envs):
+        trace = actual_trace_xyz[env_i]
+        if trace.size == 0:
+            continue
+
+        s = start_np[env_i]
+        e = end_np[env_i]
+        seg = e - s
+        seg_len = float(np.linalg.norm(seg))
+
+        if seg_len < eps:
+            off = np.linalg.norm(trace - s[None, :], axis=1)
+            along_clamped = np.zeros_like(off, dtype=np.float32)
+        else:
+            u = seg / seg_len
+            rel = trace - s[None, :]
+            along = np.einsum("ij,j->i", rel, u)
+            along_clamped = np.clip(along, 0.0, seg_len)
+            closest = s[None, :] + along_clamped[:, None] * u[None, :]
+            off = np.linalg.norm(trace - closest, axis=1)
+
+        max_off = float(np.max(off))
+        final_off = float(off[-1])
+        along_final = float(along_clamped[-1]) if along_clamped.size > 0 else 0.0
+        along_err = float(abs(seg_len - along_final))
+
+        max_offtrack[env_i] = max_off
+        final_offtrack[env_i] = final_off
+        final_along_error[env_i] = along_err
+        offtrack_violation[env_i] = bool(max_off > float(offtrack_threshold))
+
+    device = planned_start_xyz.device
+    return StickPushPhaseLineMetrics(
+        max_offtrack=torch.from_numpy(max_offtrack).to(device=device),
+        final_offtrack=torch.from_numpy(final_offtrack).to(device=device),
+        final_along_error=torch.from_numpy(final_along_error).to(device=device),
+        offtrack_violation=torch.from_numpy(offtrack_violation).to(device=device),
+    )
 
 
 class StickPush:
@@ -105,6 +199,9 @@ class StickPush:
         staging_max_attempts: int = 10,
         staging_timeout: float = 30.0,
         step_callback: Optional[Callable] = None,
+        collect_trace_debug: bool = False,
+        trace_sample_stride: int = 1,
+        trace_offtrack_threshold: float = 0.02,
     ) -> StickPushResult:
         """Execute a stick push across N environments.
 
@@ -123,19 +220,44 @@ class StickPush:
             staging_max_attempts: cuRobo planning attempts.
             staging_timeout: cuRobo planning timeout (seconds).
             step_callback: Optional (step, obs, rewards) → None.
+            collect_trace_debug: Capture planned segments and actual TCP traces
+                for entry/sweep/retract phases.
+            trace_sample_stride: Sample one trace point every k control steps.
+            trace_offtrack_threshold: Threshold used to flag off-track traces.
 
         Returns:
             StickPushResult with per-env telemetry.
         """
+        trace_sample_stride = max(1, int(trace_sample_stride))
         total_steps = 0
         eef_trace = []  # track TCP position every step
+        active_phase = "stage"
+        phase_trace_points: dict[str, list[list[np.ndarray]]] = {
+            "entry": [list() for _ in range(self.n_envs)],
+            "sweep": [list() for _ in range(self.n_envs)],
+            "retract": [list() for _ in range(self.n_envs)],
+        }
 
         def _record_eef():
             tcp = self.raw.agent.tcp.pose.p[0].cpu().numpy().copy()
             eef_trace.append(tcp)
 
+        def _record_phase_points(step: Optional[int] = None):
+            if not collect_trace_debug:
+                return
+            if active_phase not in phase_trace_points:
+                return
+            if step is not None and int(step) % trace_sample_stride != 0:
+                return
+            tcp_all = self.raw.agent.tcp.pose.p.detach().cpu().numpy()
+            for env_i in range(self.n_envs):
+                phase_trace_points[active_phase][env_i].append(
+                    tcp_all[env_i].astype(np.float32).copy()
+                )
+
         def _tracking_callback(step, obs, rew):
             _record_eef()
+            _record_phase_points(step=step)
             if step_callback is not None:
                 step_callback(step, obs, rew)
 
@@ -163,6 +285,10 @@ class StickPush:
         self.raw.agent.set_control_mode("pd_ee_delta_pose")
         self.raw.agent.controller.reset()
         _log_orientation("After mode switch (before insert)")
+        entry_start_xyz = approach_positions.to(self.device).detach().clone()
+        entry_end_xyz = entry_positions.to(self.device).detach().clone()
+        active_phase = "entry"
+        _record_phase_points()
 
         entry_result = batched_ee_delta_move(
             self.env, entry_positions,
@@ -171,6 +297,7 @@ class StickPush:
             convergence_threshold=convergence_threshold,
             step_callback=_tracking_callback,
         )
+        _record_phase_points()
         total_steps += entry_result["steps_executed"]
         logger.info("  Insert: %d steps, mean_dist=%.4f, converged=%d/%d",
                      entry_result["steps_executed"],
@@ -179,6 +306,10 @@ class StickPush:
         _log_orientation("After insert")
 
         # --- Phase 3: Sweep (pd_ee_delta_pose) ---
+        sweep_start_xyz = entry_positions.to(self.device).detach().clone()
+        sweep_end_xyz = sweep_positions.to(self.device).detach().clone()
+        active_phase = "sweep"
+        _record_phase_points()
         sweep_result = batched_ee_delta_move(
             self.env, sweep_positions,
             target_quaternions=approach_quaternions,
@@ -186,6 +317,7 @@ class StickPush:
             convergence_threshold=convergence_threshold,
             step_callback=_tracking_callback,
         )
+        _record_phase_points()
         total_steps += sweep_result["steps_executed"]
         logger.info("  Sweep: %d steps, mean_dist=%.4f, converged=%d/%d",
                      sweep_result["steps_executed"],
@@ -215,6 +347,10 @@ class StickPush:
         retract_from_here = tcp_after_nudge.clone()
         retract_from_here[:, 0] = retract_positions.to(self.device)[:, 0]  # pull X to outside shelf
         retract_from_here[:, 2] = retract_positions.to(self.device)[:, 2]  # keep target Z
+        retract_start_xyz = tcp_after_nudge.detach().clone()
+        retract_end_xyz = retract_from_here.detach().clone()
+        active_phase = "retract"
+        _record_phase_points()
         retract_result = batched_ee_delta_move(
             self.env, retract_from_here,
             target_quaternions=approach_quaternions,
@@ -222,6 +358,7 @@ class StickPush:
             convergence_threshold=convergence_threshold,
             step_callback=_tracking_callback,
         )
+        _record_phase_points()
         total_steps += retract_result["steps_executed"]
         logger.info("  Retract: %d steps, mean_dist=%.4f, converged=%d/%d",
                      retract_result["steps_executed"],
@@ -244,7 +381,6 @@ class StickPush:
         logger.info("  Rest: orient_drift=%.4f", orientation_drift.mean().item())
 
         # Dump EEF trace summary
-        import numpy as np
         trace = np.array(eef_trace)
         if len(trace) > 0:
             # Find big jumps (>5cm between consecutive frames)
@@ -260,6 +396,50 @@ class StickPush:
         # Overall success: staging + sweep converged
         success_mask = staging_success & sweep_result["converged"]
 
+        trace_debug = None
+        if collect_trace_debug:
+            entry_trace = [_stack_trace_points(p) for p in phase_trace_points["entry"]]
+            sweep_trace = [_stack_trace_points(p) for p in phase_trace_points["sweep"]]
+            retract_trace = [_stack_trace_points(p) for p in phase_trace_points["retract"]]
+            trace_debug = StickPushTraceDebug(
+                entry=StickPushPhaseTrace(
+                    phase="entry",
+                    planned_start_xyz=entry_start_xyz,
+                    planned_end_xyz=entry_end_xyz,
+                    actual_trace_xyz=entry_trace,
+                    metrics=_compute_segment_metrics(
+                        planned_start_xyz=entry_start_xyz,
+                        planned_end_xyz=entry_end_xyz,
+                        actual_trace_xyz=entry_trace,
+                        offtrack_threshold=trace_offtrack_threshold,
+                    ),
+                ),
+                sweep=StickPushPhaseTrace(
+                    phase="sweep",
+                    planned_start_xyz=sweep_start_xyz,
+                    planned_end_xyz=sweep_end_xyz,
+                    actual_trace_xyz=sweep_trace,
+                    metrics=_compute_segment_metrics(
+                        planned_start_xyz=sweep_start_xyz,
+                        planned_end_xyz=sweep_end_xyz,
+                        actual_trace_xyz=sweep_trace,
+                        offtrack_threshold=trace_offtrack_threshold,
+                    ),
+                ),
+                retract=StickPushPhaseTrace(
+                    phase="retract",
+                    planned_start_xyz=retract_start_xyz,
+                    planned_end_xyz=retract_end_xyz,
+                    actual_trace_xyz=retract_trace,
+                    metrics=_compute_segment_metrics(
+                        planned_start_xyz=retract_start_xyz,
+                        planned_end_xyz=retract_end_xyz,
+                        actual_trace_xyz=retract_trace,
+                        offtrack_threshold=trace_offtrack_threshold,
+                    ),
+                ),
+            )
+
         return StickPushResult(
             success_mask=success_mask,
             staging_success=staging_success,
@@ -268,6 +448,7 @@ class StickPush:
             retract_final_dist=retract_result["final_dists"],
             orientation_drift=orientation_drift,
             steps_executed=total_steps,
+            trace_debug=trace_debug,
         )
 
     def _stage(

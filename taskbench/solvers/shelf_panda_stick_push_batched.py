@@ -12,6 +12,9 @@ Usage:
 
 import logging
 import os
+import json
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -20,7 +23,12 @@ from taskbench.skills.curobo_motion import (
     get_arm_joint_names,
     setup_curobo_planner,
 )
-from taskbench.skills.stick_push import StickPush
+from taskbench.skills.stick_push import StickPush, StickPushTraceDebug
+from taskbench.skills.stick_push_trace_viz import (
+    build_trace_viz_spec,
+    render_trace_viz_image,
+    save_trace_viz_image,
+)
 from taskbench.solver import BaseSolver, SolverResult, register_solver
 
 logger = logging.getLogger("taskbench.solvers.shelf_panda_stick_push_batched")
@@ -84,8 +92,106 @@ class ShelfPandaStickPushBatchedSolver(BaseSolver):
     Cylinders are randomized per env (count + placement).
     """
 
-    def __init__(self, pushes_per_episode: int = 3):
+    def __init__(
+        self,
+        pushes_per_episode: int = 3,
+        trace_viz_enabled: bool = False,
+        trace_viz_root: str = "artifacts/stickpush_trace",
+        trace_viz_max_envs_per_push: int = 4,
+        trace_viz_save_only_violations: bool = True,
+        trace_viz_sample_stride: int = 2,
+    ):
         self.pushes_per_episode = int(pushes_per_episode)
+        self.trace_viz_enabled = bool(trace_viz_enabled)
+        self.trace_viz_root = str(trace_viz_root)
+        self.trace_viz_max_envs_per_push = max(1, int(trace_viz_max_envs_per_push))
+        self.trace_viz_save_only_violations = bool(trace_viz_save_only_violations)
+        self.trace_viz_sample_stride = max(1, int(trace_viz_sample_stride))
+        self._trace_viz_run_dir: Path | None = None
+
+    def _active_cylinders_xy_r(self, raw, env_idx: int) -> np.ndarray:
+        """Return active cylinder disks for one env as (M, 3): x, y, radius."""
+        if not hasattr(raw, "shelf_objects") or not hasattr(raw, "cyl_spec"):
+            return np.zeros((0, 3), dtype=np.float32)
+        radius = float(getattr(raw.cyl_spec, "radius", 0.018))
+        rows: list[list[float]] = []
+        for actor in raw.shelf_objects:
+            p = actor.pose.p[int(env_idx)].detach().cpu().numpy()
+            if float(p[0]) < 2.0:
+                rows.append([float(p[0]), float(p[1]), radius])
+        if not rows:
+            return np.zeros((0, 3), dtype=np.float32)
+        return np.asarray(rows, dtype=np.float32)
+
+    def _select_trace_viz_envs(self, trace_debug: StickPushTraceDebug) -> list[int]:
+        """Choose envs to render: violations first, then largest offtrack."""
+        if trace_debug.entry.metrics is None or trace_debug.sweep.metrics is None or trace_debug.retract.metrics is None:
+            return []
+        entry_max = trace_debug.entry.metrics.max_offtrack.detach().cpu().numpy()
+        sweep_max = trace_debug.sweep.metrics.max_offtrack.detach().cpu().numpy()
+        retract_max = trace_debug.retract.metrics.max_offtrack.detach().cpu().numpy()
+        score = np.maximum(np.maximum(entry_max, sweep_max), retract_max)
+
+        entry_bad = trace_debug.entry.metrics.offtrack_violation.detach().cpu().numpy().astype(bool)
+        sweep_bad = trace_debug.sweep.metrics.offtrack_violation.detach().cpu().numpy().astype(bool)
+        retract_bad = trace_debug.retract.metrics.offtrack_violation.detach().cpu().numpy().astype(bool)
+        any_bad = entry_bad | sweep_bad | retract_bad
+
+        if self.trace_viz_save_only_violations and bool(any_bad.any()):
+            candidates = np.where(any_bad)[0]
+        else:
+            candidates = np.arange(score.shape[0], dtype=int)
+        if candidates.size == 0:
+            return []
+        order = candidates[np.argsort(-score[candidates])]
+        return [int(x) for x in order[: self.trace_viz_max_envs_per_push]]
+
+    def _save_trace_viz_push(
+        self,
+        *,
+        raw,
+        shelf_geom,
+        seed: int | None,
+        push_idx: int,
+        trace_debug: StickPushTraceDebug,
+    ) -> None:
+        """Render and save per-env planned-vs-actual trace images for one push."""
+        if self._trace_viz_run_dir is None:
+            return
+        push_dir = self._trace_viz_run_dir / f"push_{int(push_idx):03d}"
+        push_dir.mkdir(parents=True, exist_ok=True)
+        selected_envs = self._select_trace_viz_envs(trace_debug)
+        rows = []
+        for env_idx in selected_envs:
+            blockers = self._active_cylinders_xy_r(raw, env_idx)
+            spec = build_trace_viz_spec(
+                env_idx=env_idx,
+                trace_debug=trace_debug,
+                shelf_front_x=float(shelf_geom.front_x),
+                shelf_back_x=float(shelf_geom.back_x),
+                shelf_half_w=float(shelf_geom.half_w),
+                blocker_disks_xy_r=blockers,
+            )
+            image = render_trace_viz_image(spec)
+            image_path = push_dir / f"env_{int(env_idx):04d}.png"
+            save_trace_viz_image(image_path, image)
+            rows.append(
+                {
+                    "env_idx": int(env_idx),
+                    "seed": (None if seed is None else int(seed)),
+                    "push_idx": int(push_idx),
+                    "image_path": str(image_path),
+                    "entry_max_offtrack": float(trace_debug.entry.metrics.max_offtrack[env_idx].item()),
+                    "sweep_max_offtrack": float(trace_debug.sweep.metrics.max_offtrack[env_idx].item()),
+                    "retract_max_offtrack": float(trace_debug.retract.metrics.max_offtrack[env_idx].item()),
+                    "entry_violation": bool(trace_debug.entry.metrics.offtrack_violation[env_idx].item()),
+                    "sweep_violation": bool(trace_debug.sweep.metrics.offtrack_violation[env_idx].item()),
+                    "retract_violation": bool(trace_debug.retract.metrics.offtrack_violation[env_idx].item()),
+                }
+            )
+        manifest_path = push_dir / "manifest.json"
+        with manifest_path.open("w", encoding="utf-8") as f:
+            json.dump({"push_idx": int(push_idx), "env_rows": rows}, f, indent=2, sort_keys=True)
 
     def solve(self, env, seed=None, cfg=None) -> SolverResult:
         env.reset(seed=seed)
@@ -127,6 +233,12 @@ class ShelfPandaStickPushBatchedSolver(BaseSolver):
             rest_qpos=REST_QPOS, robot_base_pos=robot_base_pos,
             safe_start_qpos=SAFE_QPOS,
         )
+        self._trace_viz_run_dir = None
+        if self.trace_viz_enabled:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            seed_tag = f"seed{seed}" if seed is not None else "seednone"
+            self._trace_viz_run_dir = Path(self.trace_viz_root) / f"{ts}_{seed_tag}_N{int(N)}"
+            self._trace_viz_run_dir.mkdir(parents=True, exist_ok=True)
 
         # Shelf config for push sampling
         shelf_dict = dict(
@@ -153,7 +265,20 @@ class ShelfPandaStickPushBatchedSolver(BaseSolver):
                 entry_positions=torch.tensor(p1_np, device=cuda, dtype=torch.float32),
                 sweep_positions=torch.tensor(p2_np, device=cuda, dtype=torch.float32),
                 retract_positions=torch.tensor(retract_np, device=cuda, dtype=torch.float32),
+                collect_trace_debug=self.trace_viz_enabled,
+                trace_sample_stride=self.trace_viz_sample_stride,
             )
+            if self.trace_viz_enabled and result.trace_debug is not None:
+                try:
+                    self._save_trace_viz_push(
+                        raw=raw,
+                        shelf_geom=g,
+                        seed=seed,
+                        push_idx=push_idx,
+                        trace_debug=result.trace_debug,
+                    )
+                except Exception:
+                    logger.exception("Trace-viz artifact write failed for push %d", push_idx)
 
             n_ok = result.success_mask.sum().item()
             total_success += n_ok
@@ -171,5 +296,8 @@ class ShelfPandaStickPushBatchedSolver(BaseSolver):
                 "n_success": total_success,
                 "n_total": total_pushes,
                 "success_rate": success_rate,
+                "trace_viz_dir": (
+                    None if self._trace_viz_run_dir is None else str(self._trace_viz_run_dir)
+                ),
             },
         )
