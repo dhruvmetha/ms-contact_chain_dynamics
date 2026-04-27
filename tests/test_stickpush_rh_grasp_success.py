@@ -4,7 +4,7 @@ import math
 
 import numpy as np
 
-from taskbench.planners.stickpush_rh.config import RecedingHorizonConfig
+from taskbench.planners.stickpush_rh.config import RecedingHorizonConfig, SamplingConfig
 from taskbench.planners.stickpush_rh.grasp_success import GraspSuccessEvaluator
 from taskbench.planners.stickpush_rh.search import StickPushRecedingHorizonSearch
 from taskbench.planners.stickpush_rh.sampler import StickPushSampler
@@ -324,6 +324,51 @@ def test_active_label_switch_changes_success():
 
     assert any_eval.active_success
     assert not straight_eval.active_success
+
+
+def test_search_effective_active_label_follows_insertion_mode():
+    scene = _scene(blockers=[_circle("b_straight", 0.40, 0.03, radius=0.012)])
+    root_xy = np.asarray(scene.target.center_xyz[:2], dtype=np.float32).copy()
+
+    cfg_any = _cfg(
+        sampling=SamplingConfig(insertion_mode="diagonal_allowed"),
+        grasp_success_templates_straight_deg=(0.0,),
+        grasp_success_templates_any_deg=(8.0,),
+    )
+    planner_any = StickPushRecedingHorizonSearch(
+        _DummyEnv(),
+        executor=object(),
+        cfg=cfg_any,
+        state_provider=_NoopProvider(),
+        sampler=StickPushSampler(cfg_any.sampling),
+    )
+    diag_any = planner_any._target_goal_checks(scene, root_target_xy=root_xy, state_hash="diag_mode")
+
+    cfg_straight = _cfg(
+        sampling=SamplingConfig(insertion_mode="straight_only"),
+        grasp_success_templates_straight_deg=(0.0,),
+        grasp_success_templates_any_deg=(8.0,),
+    )
+    planner_straight = StickPushRecedingHorizonSearch(
+        _DummyEnv(),
+        executor=object(),
+        cfg=cfg_straight,
+        state_provider=_NoopProvider(),
+        sampler=StickPushSampler(cfg_straight.sampling),
+    )
+    diag_straight = planner_straight._target_goal_checks(
+        scene,
+        root_target_xy=root_xy,
+        state_hash="straight_mode",
+    )
+
+    assert diag_any["active_label"] == "any"
+    assert diag_any["insertion_mode"] == "diagonal_allowed"
+    assert diag_any["active_success_raw"]
+
+    assert diag_straight["active_label"] == "straight"
+    assert diag_straight["insertion_mode"] == "straight_only"
+    assert not diag_straight["active_success_raw"]
 
 
 def test_metrics_follow_primary_blockers_and_improve_when_blocker_removed():

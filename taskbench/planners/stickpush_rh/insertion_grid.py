@@ -6,7 +6,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from taskbench.planners.stickpush_rh.config import SamplingConfig
+from taskbench.planners.stickpush_rh.config import (
+    INSERTION_MODE_STRAIGHT_ONLY,
+    SamplingConfig,
+    canonical_insertion_mode,
+)
 from taskbench.planners.stickpush_rh.types import SceneState
 
 
@@ -36,6 +40,9 @@ class StraightInsertionPlan:
     approach_backoff: float
     sources_checked: int
     sources_total: int
+    entry_xy_used: np.ndarray  # (2,) insertion endpoint used for feasibility/execution
+    entry_shift_cells: tuple[int, int]  # (dx_cell, dy_cell) shift from original p1 cell
+    entry_shift_xy: np.ndarray  # (2,) world shift from original p1
 
 
 def _grid_bounds(scene: SceneState, r_eff: float, resolution: float) -> tuple[float, float, float, float]:
@@ -183,6 +190,18 @@ def _weighted_without_replacement_order(
     gumbel = rng.gumbel(loc=0.0, scale=1.0, size=k)
     scores = np.log(weights) + gumbel
     return np.asarray(np.argsort(scores)[::-1], dtype=np.int32)
+
+
+def _candidate_seed(base_seed: int, dx_cell: int, dy_cell: int) -> int:
+    if int(dx_cell) == 0 and int(dy_cell) == 0:
+        return int(base_seed)
+    # Deterministic per-candidate perturbation of base seed.
+    mixed = (
+        (int(base_seed) * 0x9E3779B97F4A7C15)
+        ^ ((int(dx_cell) + 17) * 0xC2B2AE3D27D4EB4F)
+        ^ ((int(dy_cell) + 31) * 0x165667B19E3779F9)
+    ) & 0xFFFFFFFFFFFFFFFF
+    return int(mixed)
 
 
 def _endpoint_terminal_cells(grid: WavefrontGrid, end_xy: np.ndarray) -> set[tuple[int, int]]:
@@ -358,6 +377,71 @@ def line_collision_free(
     )
 
 
+def _solve_straight_candidate(
+    grid: WavefrontGrid,
+    p1_xy: np.ndarray,
+    cfg: SamplingConfig,
+) -> tuple[np.ndarray, int, int] | None:
+    interval = _entry_y_interval(grid, p1_xy, float(cfg.insertion_stick_length))
+    if interval is None:
+        return None
+    y_lo, y_hi = interval
+    p1_cell = world_to_cell(grid, p1_xy)
+    if p1_cell is None:
+        return None
+    iy_target = int(p1_cell[1])
+    source_rows = np.asarray(grid.source_cells[:, 1], dtype=np.int32)
+    matches = np.flatnonzero(source_rows == iy_target)
+    if matches.size == 0:
+        return None
+    source_idx = int(matches[0])
+    source_xy = np.asarray(grid.source_world_xy[source_idx], dtype=np.float32)
+    source_y = float(source_xy[1])
+    if source_y < float(y_lo) or source_y > float(y_hi):
+        return None
+    if not line_collision_free_dda_supercover(grid, source_xy, p1_xy, allow_end_occupied=True):
+        return None
+    return source_xy, 1, 1
+
+
+def _solve_diagonal_candidate(
+    grid: WavefrontGrid,
+    p1_xy: np.ndarray,
+    cfg: SamplingConfig,
+    *,
+    deterministic_seed: int,
+) -> tuple[np.ndarray, int, int] | None:
+    interval = _entry_y_interval(grid, p1_xy, float(cfg.insertion_stick_length))
+    if interval is None:
+        return None
+    y_lo, y_hi = interval
+
+    source_ys = np.asarray(grid.source_world_xy[:, 1], dtype=np.float64)
+    candidate_mask = (source_ys >= float(y_lo)) & (source_ys <= float(y_hi))
+    candidate_indices = np.flatnonzero(candidate_mask)
+    if candidate_indices.size == 0:
+        return None
+
+    order_local = _weighted_without_replacement_order(
+        source_ys=source_ys[candidate_indices],
+        center_y=float(p1_xy[1]),
+        decay=float(cfg.insertion_entry_weight_decay),
+        uniform_mix=float(cfg.insertion_entry_uniform_mix),
+        seed=int(deterministic_seed),
+    )
+
+    ordered_indices = candidate_indices[np.asarray(order_local, dtype=np.int32)]
+    sources_total = int(ordered_indices.size)
+    sources_checked = 0
+    for idx in ordered_indices:
+        sources_checked += 1
+        source_xy = np.asarray(grid.source_world_xy[int(idx)], dtype=np.float32)
+        if not line_collision_free_dda_supercover(grid, source_xy, p1_xy, allow_end_occupied=True):
+            continue
+        return source_xy, int(sources_checked), int(sources_total)
+    return None
+
+
 def solve_straight_insertion(
     grid: WavefrontGrid,
     scene: SceneState,
@@ -373,44 +457,55 @@ def solve_straight_insertion(
         return None
 
     p1 = np.asarray(p1_xy, dtype=np.float32).reshape(2)
-    if world_to_cell(grid, p1) is None:
+    p1_cell = world_to_cell(grid, p1)
+    if p1_cell is None:
         return None
-
-    interval = _entry_y_interval(grid, p1, float(cfg.insertion_stick_length))
-    if interval is None:
-        return None
-    y_lo, y_hi = interval
-
-    source_ys = np.asarray(grid.source_world_xy[:, 1], dtype=np.float64)
-    candidate_mask = (source_ys >= float(y_lo)) & (source_ys <= float(y_hi))
-    candidate_indices = np.flatnonzero(candidate_mask)
-    if candidate_indices.size == 0:
-        return None
-
-    if deterministic_seed is None:
-        deterministic_seed = 0
-
-    order_local = _weighted_without_replacement_order(
-        source_ys=source_ys[candidate_indices],
-        center_y=float(p1[1]),
-        decay=float(cfg.insertion_entry_weight_decay),
-        uniform_mix=float(cfg.insertion_entry_uniform_mix),
-        seed=int(deterministic_seed),
+    insertion_mode = canonical_insertion_mode(getattr(cfg, "insertion_mode", None))
+    base_seed = 0 if deterministic_seed is None else int(deterministic_seed)
+    candidate_offsets = (
+        (0, 0),
+        (0, 1),
+        (0, -1),
+        (1, 0),
+        (-1, 0),
+        (1, 1),
+        (1, -1),
+        (-1, 1),
+        (-1, -1),
     )
 
-    ordered_indices = candidate_indices[np.asarray(order_local, dtype=np.int32)]
-    sources_total = int(ordered_indices.size)
-    sources_checked = 0
-    for idx in ordered_indices:
-        sources_checked += 1
-        source_xy = grid.source_world_xy[int(idx)]
-        if not line_collision_free_dda_supercover(grid, source_xy, p1, allow_end_occupied=True):
+    ix0, iy0 = int(p1_cell[0]), int(p1_cell[1])
+    for dx_cell, dy_cell in candidate_offsets:
+        ix = ix0 + int(dx_cell)
+        iy = iy0 + int(dy_cell)
+        if ix < 0 or ix >= int(grid.nx) or iy < 0 or iy >= int(grid.ny):
             continue
+
+        if int(dx_cell) == 0 and int(dy_cell) == 0:
+            p1_candidate = np.asarray(p1, dtype=np.float32).copy()
+        else:
+            p1_candidate = cell_to_world(grid, (ix, iy))
+
+        if insertion_mode == INSERTION_MODE_STRAIGHT_ONLY:
+            solved = _solve_straight_candidate(grid, p1_candidate, cfg)
+        else:
+            solved = _solve_diagonal_candidate(
+                grid,
+                p1_candidate,
+                cfg,
+                deterministic_seed=_candidate_seed(base_seed, int(dx_cell), int(dy_cell)),
+            )
+        if solved is None:
+            continue
+
+        source_xy, sources_checked, sources_total = solved
         return StraightInsertionPlan(
-            source_xy=np.asarray(source_xy, dtype=np.float32),
+            source_xy=np.asarray(source_xy, dtype=np.float32).copy(),
             approach_backoff=float(cfg.insertion_approach_backoff),
             sources_checked=int(sources_checked),
             sources_total=int(sources_total),
+            entry_xy_used=np.asarray(p1_candidate, dtype=np.float32).copy(),
+            entry_shift_cells=(int(dx_cell), int(dy_cell)),
+            entry_shift_xy=(np.asarray(p1_candidate, dtype=np.float32) - np.asarray(p1, dtype=np.float32)),
         )
-
     return None

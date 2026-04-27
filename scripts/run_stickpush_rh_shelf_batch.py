@@ -56,6 +56,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seed", type=int, default=20000)
     parser.add_argument("--max-executions", type=int, default=1000)
     parser.add_argument("--max-depth", type=int, default=256)
+    parser.add_argument(
+        "--insertion-mode",
+        type=str,
+        default="diagonal_allowed",
+        choices=("diagonal_allowed", "straight_only"),
+    )
     parser.add_argument("--visual-save-images", action="store_true")
     parser.add_argument("--visual-save-frontier-csv", action="store_true")
     parser.add_argument(
@@ -101,6 +107,7 @@ def main() -> None:
     solver = ShelfStickPushRecedingHorizonSolver(
         max_executions=int(args.max_executions),
         max_depth=int(args.max_depth),
+        insertion_mode=str(args.insertion_mode),
         visual_save_images=bool(args.visual_save_images),
         visual_save_frontier_csv=bool(args.visual_save_frontier_csv),
         artifact_root=str(tmp_root),
@@ -200,6 +207,7 @@ def main() -> None:
                 "max_seed": int(args.max_seed),
                 "max_executions": int(args.max_executions),
                 "max_depth": int(args.max_depth),
+                "insertion_mode": str(args.insertion_mode),
                 "num_objects": int(args.num_objects),
                 "visual_save_images": bool(args.visual_save_images),
                 "visual_save_frontier_csv": bool(args.visual_save_frontier_csv),

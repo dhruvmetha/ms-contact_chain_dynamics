@@ -6,10 +6,13 @@ import gymnasium as gym
 import torch
 
 from taskbench.planners.stickpush_rh.config import (
+    INSERTION_MODE_DIAGONAL_ALLOWED,
     RecedingHorizonConfig,
     SamplingConfig,
     UCBConfig,
     VisualConfig,
+    active_label_for_insertion_mode,
+    canonical_insertion_mode,
 )
 from taskbench.planners.stickpush_rh.executor import StickPushBatchExecutor, StickPushExecutor
 from taskbench.planners.stickpush_rh.search import StickPushRecedingHorizonSearch
@@ -64,6 +67,7 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         insertion_stick_length: float = 0.25,
         insertion_entry_weight_decay: float = 0.04,
         insertion_entry_uniform_mix: float = 0.15,
+        insertion_mode: str = INSERTION_MODE_DIAGONAL_ALLOWED,
         max_target_shift_xy: float = 0.02,
         target_wall_margin: float = 0.01,
         prune_target_invalid_nodes: bool = False,
@@ -134,6 +138,7 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         self.insertion_stick_length = float(insertion_stick_length)
         self.insertion_entry_weight_decay = float(insertion_entry_weight_decay)
         self.insertion_entry_uniform_mix = float(insertion_entry_uniform_mix)
+        self.insertion_mode = str(insertion_mode)
         self.max_target_shift_xy = float(max_target_shift_xy)
         self.target_wall_margin = float(target_wall_margin)
         self.prune_target_invalid_nodes = bool(prune_target_invalid_nodes)
@@ -185,6 +190,8 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         if self.x_approach_values is not None and len(self.x_approach_values) > 0:
             # Backward compatibility: legacy x_approach list now maps to one deterministic backoff.
             approach_backoff = float(self.x_approach_values[0])
+        insertion_mode = canonical_insertion_mode(self.insertion_mode)
+        effective_active_label = active_label_for_insertion_mode(insertion_mode)
 
         sampling = SamplingConfig(
             heading_degrees=tuple(self.heading_degrees) if self.heading_degrees is not None else SamplingConfig().heading_degrees,
@@ -211,6 +218,7 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
             insertion_stick_length=self.insertion_stick_length,
             insertion_entry_weight_decay=self.insertion_entry_weight_decay,
             insertion_entry_uniform_mix=self.insertion_entry_uniform_mix,
+            insertion_mode=insertion_mode,
             min_push_len=self.min_push_len,
             min_insertion_depth=self.min_insertion_depth,
         )
@@ -236,7 +244,7 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
             target_wall_margin=self.target_wall_margin,
             prune_target_invalid_nodes=self.prune_target_invalid_nodes,
             require_target_shift_limit_for_success=self.require_target_shift_limit_for_success,
-            grasp_success_active_label=self.grasp_success_active_label,
+            grasp_success_active_label=effective_active_label,
             grasp_success_templates_straight_deg=tuple(self.grasp_success_templates_straight_deg),
             grasp_success_templates_any_deg=tuple(self.grasp_success_templates_any_deg),
             grasp_success_grid_resolution=self.grasp_success_grid_resolution,

@@ -3,9 +3,11 @@ from __future__ import annotations
 import numpy as np
 
 from taskbench.planners.stickpush_rh.config import RecedingHorizonConfig, SamplingConfig
+from taskbench.planners.stickpush_rh.insertion_grid import StraightInsertionPlan
 from taskbench.planners.stickpush_rh.sampler import StickPushSampler
+import taskbench.planners.stickpush_rh.search as search_mod
 from taskbench.planners.stickpush_rh.search import StickPushRecedingHorizonSearch
-from taskbench.planners.stickpush_rh.types import ObjectState, SceneState
+from taskbench.planners.stickpush_rh.types import ObjectState, PlannerAction, SceneState
 
 
 class _DummyEnv:
@@ -80,3 +82,77 @@ def test_wavefront_and_feasible_actions_are_cached_for_state_hash():
     assert len(planner._wavefront_cache) == 1
     assert len(planner._feasible_action_cache) == 1
     assert len(actions_1) == len(actions_2) > 0
+
+
+def test_build_node_actions_applies_shifted_entry_and_records_shift_metadata(monkeypatch):
+    cfg = RecedingHorizonConfig(
+        sampling=SamplingConfig(
+            use_wavefront_insertion_solver=True,
+            insertion_mode="straight_only",
+            insertion_grid_resolution=0.003,
+            insertion_stick_length=0.5,
+        )
+    )
+
+    p_a = np.array([0.15, 0.0, 0.411], dtype=np.float32)
+    p1 = np.array([0.40, 0.11, 0.411], dtype=np.float32)
+    p2 = np.array([0.55, -0.02, 0.411], dtype=np.float32)
+    p_r = np.array([0.10, -0.02, 0.411], dtype=np.float32)
+    sampled_action = PlannerAction(
+        blocker_name="b0",
+        theta_deg=0.0,
+        x_approach=0.07,
+        delta_len_idx=0,
+        contact_offset=0.02,
+        push_len=0.15,
+        approach_xyz=p_a,
+        entry_xyz=p1,
+        sweep_xyz=p2,
+        retract_xyz=p_r,
+        meta={},
+    )
+
+    class _OneActionSampler:
+        def sample_actions(self, scene: SceneState, *, focus_object_names=None, focus_meta=None):
+            return [sampled_action]
+
+    forced_plan = StraightInsertionPlan(
+        source_xy=np.array([0.207, -0.01], dtype=np.float32),
+        approach_backoff=0.07,
+        sources_checked=2,
+        sources_total=9,
+        entry_xy_used=np.array([0.42, 0.08], dtype=np.float32),
+        entry_shift_cells=(1, -1),
+        entry_shift_xy=np.array([0.02, -0.03], dtype=np.float32),
+    )
+
+    def _fake_solve(grid, scene, p1_xy, sampling_cfg, *, deterministic_seed=None):
+        del grid, scene, p1_xy, sampling_cfg, deterministic_seed
+        return forced_plan
+
+    monkeypatch.setattr(search_mod, "solve_straight_insertion", _fake_solve)
+
+    planner = StickPushRecedingHorizonSearch(
+        _DummyEnv(),
+        executor=object(),
+        cfg=cfg,
+        state_provider=None,
+        sampler=_OneActionSampler(),
+    )
+    scene = _simple_scene()
+    actions, diag = planner._build_node_actions(
+        scene,
+        state_hash="shifted_entry_state",
+        rng=np.random.default_rng(0),
+    )
+
+    assert diag["num_sampled_actions"] == 1
+    assert diag["num_feasible_actions"] == 1
+    assert len(actions) == 1
+    out = actions[0]
+    assert np.allclose(out.entry_xyz[:2], forced_plan.entry_xy_used, atol=1e-6)
+    assert np.allclose(out.sweep_xyz[:2], sampled_action.sweep_xyz[:2], atol=1e-6)
+    assert np.allclose(np.asarray(out.meta["insertion_entry_xy_used"], dtype=np.float32), forced_plan.entry_xy_used)
+    assert out.meta["insertion_entry_shift_cells"] == [1, -1]
+    assert np.allclose(np.asarray(out.meta["insertion_entry_shift_xy"], dtype=np.float32), forced_plan.entry_shift_xy)
+    assert out.meta["insertion_entry_shift_applied"] is True

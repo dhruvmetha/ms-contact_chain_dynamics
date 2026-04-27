@@ -24,6 +24,12 @@ def main():
     parser.add_argument("--max-executions", type=int, default=200)
     parser.add_argument("--max-depth", type=int, default=128)
     parser.add_argument("--artifact-root", type=str, default="artifacts/stickpush_rh")
+    parser.add_argument(
+        "--insertion-mode",
+        type=str,
+        default="diagonal_allowed",
+        choices=("diagonal_allowed", "straight_only"),
+    )
     args = parser.parse_args()
 
     env = gym.make(
@@ -41,6 +47,7 @@ def main():
         max_executions=args.max_executions,
         max_depth=args.max_depth,
         artifact_root=args.artifact_root,
+        insertion_mode=args.insertion_mode,
     )
     result = solver.solve(env, seed=args.seed)
     env.close()

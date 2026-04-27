@@ -9,7 +9,11 @@ import time
 
 import numpy as np
 
-from taskbench.planners.stickpush_rh.config import RecedingHorizonConfig
+from taskbench.planners.stickpush_rh.config import (
+    RecedingHorizonConfig,
+    active_label_for_insertion_mode,
+    canonical_insertion_mode,
+)
 from taskbench.planners.stickpush_rh.executor import StickPushBatchExecutor, StickPushExecutor
 from taskbench.planners.stickpush_rh.frontier_ucb import FrontierUCB
 from taskbench.planners.stickpush_rh.geometry import hash_scene_state
@@ -111,6 +115,11 @@ class StickPushRecedingHorizonSearch:
         self.env = env
         self.raw = env.unwrapped
         self.cfg = cfg
+        self._insertion_mode = canonical_insertion_mode(self.cfg.sampling.insertion_mode)
+        self.cfg.sampling.insertion_mode = self._insertion_mode
+        self._effective_active_label = active_label_for_insertion_mode(self._insertion_mode)
+        # Backward-compatible field kept for downstream readers.
+        self.cfg.grasp_success_active_label = self._effective_active_label
         self.executor = executor
         self.batch_executor = batch_executor
         self.state_provider = state_provider or GTSceneStateProvider(env_index=0)
@@ -214,6 +223,7 @@ class StickPushRecedingHorizonSearch:
         grasp_eval: GraspSuccessResult = self.grasp_success.evaluate(
             scene,
             state_hash=state_hash,
+            active_label_override=self._effective_active_label,
         )
         goal_labels = grasp_eval.to_dict()
         active_success_raw = bool(grasp_eval.active_success)
@@ -226,6 +236,7 @@ class StickPushRecedingHorizonSearch:
             "graspable_straight": bool(grasp_eval.graspable_straight),
             "graspable_any": bool(grasp_eval.graspable_any),
             "active_label": str(grasp_eval.active_label),
+            "insertion_mode": str(self._insertion_mode),
             "active_success_raw": active_success_raw,
             "target_wall_margin": float(self.cfg.target_wall_margin),
             "max_target_shift_xy": float(self.cfg.max_target_shift_xy),
@@ -466,6 +477,7 @@ class StickPushRecedingHorizonSearch:
                 dtype=np.float32,
             )
             entry = np.asarray(action.entry_xyz, dtype=np.float32).copy()
+            entry[:2] = np.asarray(plan.entry_xy_used, dtype=np.float32)
             sweep = np.asarray(action.sweep_xyz, dtype=np.float32).copy()
             entry[2] = z_push
             sweep[2] = z_push
@@ -483,6 +495,12 @@ class StickPushRecedingHorizonSearch:
             meta["insertion_sources_checked"] = int(plan.sources_checked)
             meta["insertion_sources_total"] = int(plan.sources_total)
             meta["insertion_solver"] = "entry_interval_weighted_dda_supercover"
+            meta["insertion_entry_xy_used"] = np.asarray(plan.entry_xy_used, dtype=np.float32).tolist()
+            meta["insertion_entry_shift_cells"] = [int(plan.entry_shift_cells[0]), int(plan.entry_shift_cells[1])]
+            meta["insertion_entry_shift_xy"] = np.asarray(plan.entry_shift_xy, dtype=np.float32).tolist()
+            meta["insertion_entry_shift_applied"] = bool(
+                int(plan.entry_shift_cells[0]) != 0 or int(plan.entry_shift_cells[1]) != 0
+            )
 
             feasible_actions.append(
                 PlannerAction(
@@ -1311,7 +1329,8 @@ class StickPushRecedingHorizonSearch:
             "root_metrics": serialize_metrics(root_metrics),
             "best_metrics": serialize_metrics(nodes[best_node_id].metrics),
             "goal_labels": {
-                "active_label": str(self.cfg.grasp_success_active_label),
+                "active_label": str(self._effective_active_label),
+                "insertion_mode": str(self._insertion_mode),
                 "root": dict(root_goal_diag.get("goal_labels", {})),
                 "root_active_success": bool(root_goal_diag.get("active_success", False)),
             },

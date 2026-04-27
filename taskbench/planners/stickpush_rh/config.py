@@ -4,6 +4,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+INSERTION_MODE_DIAGONAL_ALLOWED = "diagonal_allowed"
+INSERTION_MODE_STRAIGHT_ONLY = "straight_only"
+_VALID_INSERTION_MODES = {
+    INSERTION_MODE_DIAGONAL_ALLOWED,
+    INSERTION_MODE_STRAIGHT_ONLY,
+}
+
+
+def canonical_insertion_mode(mode: str | None) -> str:
+    value = str(mode or "").strip().lower()
+    if value not in _VALID_INSERTION_MODES:
+        return INSERTION_MODE_DIAGONAL_ALLOWED
+    return value
+
+
+def active_label_for_insertion_mode(mode: str | None) -> str:
+    canonical = canonical_insertion_mode(mode)
+    if canonical == INSERTION_MODE_STRAIGHT_ONLY:
+        return "straight"
+    return "any"
+
 
 @dataclass
 class SamplingConfig:
@@ -53,6 +74,7 @@ class SamplingConfig:
     insertion_stick_length: float = 0.25
     insertion_entry_weight_decay: float = 0.04
     insertion_entry_uniform_mix: float = 0.15
+    insertion_mode: str = INSERTION_MODE_DIAGONAL_ALLOWED  # {"diagonal_allowed", "straight_only"}
 
 
 @dataclass
@@ -103,3 +125,7 @@ class RecedingHorizonConfig:
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     ucb: UCBConfig = field(default_factory=UCBConfig)
     visual: VisualConfig = field(default_factory=VisualConfig)
+
+    @property
+    def effective_grasp_success_active_label(self) -> str:
+        return active_label_for_insertion_mode(self.sampling.insertion_mode)

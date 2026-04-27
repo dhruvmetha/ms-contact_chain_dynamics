@@ -435,6 +435,7 @@ class GraspSuccessEvaluator:
         scene: SceneState,
         *,
         state_hash: str | None = None,
+        active_label_override: str | None = None,
     ) -> GraspSuccessResult:
         if state_hash is None:
             state_hash = hash_scene_state(scene)
@@ -460,7 +461,8 @@ class GraspSuccessEvaluator:
 
         graspable_straight = bool(any(r.passed for r in straight_rows))
         graspable_any = bool(any(r.passed for r in any_rows))
-        active_label = str(self.cfg.grasp_success_active_label).strip().lower()
+        label_source = active_label_override if active_label_override is not None else self.cfg.grasp_success_active_label
+        active_label = str(label_source).strip().lower()
         if active_label not in {"straight", "any"}:
             active_label = "any"
         active_rows = straight_rows if active_label == "straight" else any_rows

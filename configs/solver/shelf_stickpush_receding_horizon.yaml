@@ -33,10 +33,12 @@ run:
     insertion_stick_length: 0.25
     insertion_entry_weight_decay: 0.04
     insertion_entry_uniform_mix: 0.15
+    insertion_mode: diagonal_allowed
     max_target_shift_xy: 0.02
     target_wall_margin: 0.01
     prune_target_invalid_nodes: false
     require_target_shift_limit_for_success: false
+    # Legacy field (still accepted): effective active label is derived from insertion_mode.
     grasp_success_active_label: any
     grasp_success_templates_straight_deg: [0]
     grasp_success_templates_any_deg: [0, -20, 20, -40, 40]
