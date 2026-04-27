@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from taskbench.planners.stickpush_rh.geometry import collect_blockers_in_clearance
 from taskbench.planners.stickpush_rh.perception_interface import SceneStateProvider
 from taskbench.planners.stickpush_rh.types import ObjectState, SceneState
 
@@ -27,12 +26,33 @@ class GTSceneStateProvider(SceneStateProvider):
         for name, actor in obj_map.items():
             center = actor.pose.p[self.env_index].detach().cpu().numpy().astype(np.float32)
             active = bool(center[0] < self.active_x_threshold)
+            footprint_type = "circle"
+            footprint_params = {"radius": radius}
+            # Optional future-proof metadata for non-circular objects.
+            shape_kind = getattr(actor, "footprint_type", None)
+            if isinstance(shape_kind, str) and shape_kind == "obox":
+                half_extents_xy = getattr(actor, "footprint_half_extents_xy", None)
+                if half_extents_xy is not None:
+                    he = np.asarray(half_extents_xy, dtype=np.float32).reshape(-1)
+                    if he.size >= 2:
+                        q = actor.pose.q[self.env_index].detach().cpu().numpy().astype(np.float32)
+                        # Yaw from quaternion in wxyz convention.
+                        w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+                        siny_cosp = 2.0 * (w * z + x * y)
+                        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+                        footprint_type = "obox"
+                        footprint_params = {
+                            "half_extents": [float(he[0]), float(he[1])],
+                            "yaw": float(np.arctan2(siny_cosp, cosy_cosp)),
+                        }
             state = ObjectState(
                 name=name,
                 center_xyz=center,
                 radius=radius,
                 is_target=(name == target_name),
                 active=active,
+                footprint_type=footprint_type,
+                footprint_params=footprint_params,
             )
             all_objects.append(state)
             if state.is_target:
@@ -56,7 +76,3 @@ class GTSceneStateProvider(SceneStateProvider):
             open_dir_xy=np.array([-1.0, 0.0], dtype=np.float32),
         )
         return scene
-
-    def blockers_in_clearance(self, scene: SceneState, clearance_radius: float):
-        return collect_blockers_in_clearance(scene, clearance_radius)
-

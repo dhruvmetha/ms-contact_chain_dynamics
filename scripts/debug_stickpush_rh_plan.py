@@ -23,7 +23,6 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-executions", type=int, default=200)
     parser.add_argument("--max-depth", type=int, default=128)
-    parser.add_argument("--clearance-radius", type=float, default=0.10)
     parser.add_argument("--artifact-root", type=str, default="artifacts/stickpush_rh")
     args = parser.parse_args()
 
@@ -41,7 +40,6 @@ def main():
     solver = ShelfStickPushRecedingHorizonSolver(
         max_executions=args.max_executions,
         max_depth=args.max_depth,
-        clearance_radius=args.clearance_radius,
         artifact_root=args.artifact_root,
     )
     result = solver.solve(env, seed=args.seed)

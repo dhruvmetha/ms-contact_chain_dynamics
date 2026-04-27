@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 class SamplingConfig:
     """Sampling knobs for planner action generation."""
 
-    clearance_radius: float = 0.10
     heading_degrees: tuple[float, ...] = (
         0.0,
         45.0,
@@ -89,6 +88,18 @@ class RecedingHorizonConfig:
     target_wall_margin: float = 0.01
     prune_target_invalid_nodes: bool = False
     require_target_shift_limit_for_success: bool = False
+    grasp_success_active_label: str = "any"  # {"straight", "any"}
+    grasp_success_templates_straight_deg: tuple[float, ...] = (0.0,)
+    grasp_success_templates_any_deg: tuple[float, ...] = (0.0, -20.0, 20.0, -40.0, 40.0)
+    grasp_success_grid_resolution: float = 0.003
+    grasp_success_front_outside_offset: float = 0.06
+    grasp_success_finger_thickness: float = 0.012
+    grasp_success_finger_length: float = 0.05
+    grasp_success_jaw_open: float = 0.06
+    grasp_success_jaw_contact: float = 0.036
+    grasp_success_contact_pad_width: float = 0.01
+    grasp_success_contact_pad_depth: float = 0.01
+    grasp_success_collision_epsilon: float = 0.0
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     ucb: UCBConfig = field(default_factory=UCBConfig)
     visual: VisualConfig = field(default_factory=VisualConfig)

@@ -12,12 +12,8 @@ import numpy as np
 from taskbench.planners.stickpush_rh.config import RecedingHorizonConfig
 from taskbench.planners.stickpush_rh.executor import StickPushBatchExecutor, StickPushExecutor
 from taskbench.planners.stickpush_rh.frontier_ucb import FrontierUCB
-from taskbench.planners.stickpush_rh.geometry import (
-    compute_node_metrics,
-    front_semicircle_wall_intersections,
-    grasp_semicircle_center_xy,
-    hash_scene_state,
-)
+from taskbench.planners.stickpush_rh.geometry import hash_scene_state
+from taskbench.planners.stickpush_rh.grasp_success import GraspSuccessEvaluator, GraspSuccessResult
 from taskbench.planners.stickpush_rh.insertion_grid import (
     WavefrontGrid,
     build_wavefront_grid,
@@ -120,6 +116,7 @@ class StickPushRecedingHorizonSearch:
         self.state_provider = state_provider or GTSceneStateProvider(env_index=0)
         self.sampler = sampler or StickPushSampler(cfg.sampling)
         self.ucb = ucb or FrontierUCB(cfg.ucb)
+        self.grasp_success = GraspSuccessEvaluator(cfg)
         self.timing_enabled = bool(self.cfg.visual.save_timing_diagnostics)
         self._wavefront_cache: dict[str, WavefrontGrid] = {}
         self._feasible_action_cache: dict[str, list[PlannerAction]] = {}
@@ -209,40 +206,69 @@ class StickPushRecedingHorizonSearch:
         scene,
         *,
         root_target_xy: np.ndarray,
+        state_hash: str,
     ) -> dict:
         target_xy = scene.target.center_xyz[:2]
         shift_xy = float(np.linalg.norm(target_xy - root_target_xy))
         shift_ok = shift_xy <= float(self.cfg.max_target_shift_xy)
-        grasp_center_xy = grasp_semicircle_center_xy(scene.target, scene.open_dir_xy)
-
-        # Front side is open; wall checks are limited to intersections with the
-        # front semicircle region (same region used for blocker clearance).
-        side_wall_dist = float(scene.shelf_half_w - abs(float(grasp_center_xy[1])))
-        back_wall_dist = float(scene.shelf_back_x - float(grasp_center_xy[0]))
-        wall_radius = float(self.cfg.sampling.clearance_radius)
-        wall_hits = front_semicircle_wall_intersections(scene, wall_radius)
-        wall_in_radius = bool(len(wall_hits) > 0)
+        grasp_eval: GraspSuccessResult = self.grasp_success.evaluate(
+            scene,
+            state_hash=state_hash,
+        )
+        goal_labels = grasp_eval.to_dict()
+        active_success_raw = bool(grasp_eval.active_success)
 
         return {
             "target_xy": target_xy.tolist(),
-            "grasp_center_xy": grasp_center_xy.tolist(),
             "target_shift_xy": shift_xy,
             "target_shift_ok": bool(shift_ok),
-            "side_wall_dist": side_wall_dist,
-            "back_wall_dist": back_wall_dist,
-            "wall_radius_threshold": wall_radius,
-            "wall_in_radius": wall_in_radius,
-            "wall_intersections": wall_hits,
+            "goal_labels": goal_labels,
+            "graspable_straight": bool(grasp_eval.graspable_straight),
+            "graspable_any": bool(grasp_eval.graspable_any),
+            "active_label": str(grasp_eval.active_label),
+            "active_success_raw": active_success_raw,
             "target_wall_margin": float(self.cfg.target_wall_margin),
             "max_target_shift_xy": float(self.cfg.max_target_shift_xy),
+            "primary_blocking_objects": list(grasp_eval.primary_blocking_objects),
+            "blocking_objects_union": list(grasp_eval.blocking_objects_union),
+            "primary_penetration_sum": float(grasp_eval.primary_penetration_sum),
+            "primary_min_margin": float(grasp_eval.primary_min_margin),
+            "stencil_cfg": {
+                "front_outside_offset": float(self.cfg.grasp_success_front_outside_offset),
+                "finger_thickness": float(self.cfg.grasp_success_finger_thickness),
+                "finger_length": float(self.cfg.grasp_success_finger_length),
+                "jaw_open": float(self.cfg.grasp_success_jaw_open),
+                "jaw_contact": float(self.cfg.grasp_success_jaw_contact),
+                "contact_pad_width": float(self.cfg.grasp_success_contact_pad_width),
+                "contact_pad_depth": float(self.cfg.grasp_success_contact_pad_depth),
+            },
         }
 
-    def _goal_satisfied(self, metrics: NodeMetrics, goal_checks: dict) -> bool:
-        solved_by_clearance = bool(metrics.blockers == 0)
-        wall_clear = not bool(goal_checks.get("wall_in_radius", False))
+    def _goal_satisfied(self, goal_checks: dict) -> bool:
+        active_success = bool(goal_checks.get("active_success_raw", False))
+        if not active_success:
+            return False
         if self.cfg.require_target_shift_limit_for_success and not goal_checks.get("target_shift_ok", False):
             return False
-        return bool(solved_by_clearance and wall_clear)
+        return True
+
+    def _metrics_from_goal(
+        self,
+        *,
+        goal_checks: dict,
+        pushes_used: int,
+    ) -> NodeMetrics:
+        blockers = int(len(goal_checks.get("primary_blocking_objects", [])))
+        min_margin = float(goal_checks.get("primary_min_margin", 0.0))
+        deficit = float(goal_checks.get("primary_penetration_sum", 0.0))
+        solved = bool(self._goal_satisfied(goal_checks))
+        return NodeMetrics(
+            blockers=blockers,
+            min_margin=min_margin,
+            deficit=deficit,
+            pushes_used=int(pushes_used),
+            solved=solved,
+        )
 
     @staticmethod
     def _shuffle_actions(
@@ -315,13 +341,19 @@ class StickPushRecedingHorizonSearch:
         *,
         state_hash: str,
         rng: np.random.Generator,
+        focus_object_names: list[str] | None = None,
+        focus_meta: dict | None = None,
     ) -> tuple[list[PlannerAction], dict]:
         timing_enabled = bool(self.timing_enabled)
         t_total_ns = time.perf_counter_ns()
 
         if not self.cfg.sampling.use_wavefront_insertion_solver:
             t_sampling_ns = time.perf_counter_ns()
-            sampled_actions = self.sampler.sample_actions(scene)
+            sampled_actions = self.sampler.sample_actions(
+                scene,
+                focus_object_names=focus_object_names,
+                focus_meta=focus_meta,
+            )
             sampling_ms = _elapsed_ms(t_sampling_ns)
             t_shuffle_ns = time.perf_counter_ns()
             shuffled = self._shuffle_actions(sampled_actions, rng)
@@ -380,7 +412,11 @@ class StickPushRecedingHorizonSearch:
             return shuffled, diagnostics
 
         t_sampling_ns = time.perf_counter_ns()
-        sampled_actions = self.sampler.sample_actions(scene)
+        sampled_actions = self.sampler.sample_actions(
+            scene,
+            focus_object_names=focus_object_names,
+            focus_meta=focus_meta,
+        )
         sampling_ms = _elapsed_ms(t_sampling_ns)
         diagnostics = {
             "num_sampled_actions": int(len(sampled_actions)),
@@ -573,19 +609,21 @@ class StickPushRecedingHorizonSearch:
                 action_gen_wavefront_cache_hits += 1
 
         root_scene = self.state_provider.get_scene_state(self.env)
-        root_metrics = compute_node_metrics(
-            root_scene, self.cfg.sampling.clearance_radius, pushes_used=0
-        )
-        root_target_xy = root_scene.target.center_xyz[:2].copy()
-        root_goal_diag = self._target_goal_checks(root_scene, root_target_xy=root_target_xy)
-        root_goal_diag["solved_by_clearance"] = bool(root_metrics.blockers == 0)
-        root_goal_diag["wall_clear"] = bool(not root_goal_diag["wall_in_radius"])
-        root_metrics.solved = self._goal_satisfied(root_metrics, root_goal_diag)
         root_state_hash = hash_scene_state(root_scene)
+        root_target_xy = root_scene.target.center_xyz[:2].copy()
+        root_goal_diag = self._target_goal_checks(
+            root_scene,
+            root_target_xy=root_target_xy,
+            state_hash=root_state_hash,
+        )
+        root_goal_diag["active_success"] = bool(self._goal_satisfied(root_goal_diag))
+        root_metrics = self._metrics_from_goal(goal_checks=root_goal_diag, pushes_used=0)
         root_actions, root_action_diag = self._build_node_actions(
             root_scene,
             state_hash=root_state_hash,
             rng=rng,
+            focus_object_names=list(root_goal_diag.get("primary_blocking_objects", [])),
+            focus_meta=root_goal_diag,
         )
         _record_action_generation(stage="root", node_id=0, depth=0, diagnostics=root_action_diag)
 
@@ -621,7 +659,7 @@ class StickPushRecedingHorizonSearch:
                 root_scene,
                 root_actions,
                 selected_action=None,
-                clearance_radius=self.cfg.sampling.clearance_radius,
+                goal_overlay=root_goal_diag,
                 max_candidates_drawn=self.cfg.visual.max_candidates_drawn,
             ),
         )
@@ -775,6 +813,13 @@ class StickPushRecedingHorizonSearch:
             if "staging_fallback_applied" in exec_result.info:
                 executed_action.meta["staging_fallback_applied"] = bool(exec_result.info["staging_fallback_applied"])
             candidate_snapshot = [executed_action] + list(node.untried_actions)
+            scene_before_hash = hash_scene_state(scene_before)
+            scene_before_goal_diag = self._target_goal_checks(
+                scene_before,
+                root_target_xy=root_target_xy,
+                state_hash=scene_before_hash,
+            )
+            scene_before_goal_diag["active_success"] = bool(self._goal_satisfied(scene_before_goal_diag))
             reject_reason: str | None = None
             if not bool(exec_result.info.get("staging_success", True)):
                 reject_reason = "staging_failed"
@@ -802,7 +847,7 @@ class StickPushRecedingHorizonSearch:
                             scene_before,
                             candidate_snapshot,
                             selected_action=executed_action,
-                            clearance_radius=self.cfg.sampling.clearance_radius,
+                            goal_overlay=scene_before_goal_diag,
                             max_candidates_drawn=self.cfg.visual.max_candidates_drawn,
                         ),
                     )
@@ -812,7 +857,7 @@ class StickPushRecedingHorizonSearch:
                             scene_before,
                             [executed_action],
                             selected_action=executed_action,
-                            clearance_radius=self.cfg.sampling.clearance_radius,
+                            goal_overlay=scene_before_goal_diag,
                             max_candidates_drawn=1,
                         ),
                     )
@@ -925,15 +970,17 @@ class StickPushRecedingHorizonSearch:
 
             scene_after = self.state_provider.get_scene_state(self.env)
             child_state = self.raw.get_state().clone()
-            child_metrics = compute_node_metrics(
+            child_state_hash = hash_scene_state(scene_after)
+            child_goal_diag = self._target_goal_checks(
                 scene_after,
-                self.cfg.sampling.clearance_radius,
+                root_target_xy=root_target_xy,
+                state_hash=child_state_hash,
+            )
+            child_goal_diag["active_success"] = bool(self._goal_satisfied(child_goal_diag))
+            child_metrics = self._metrics_from_goal(
+                goal_checks=child_goal_diag,
                 pushes_used=node.metrics.pushes_used + 1,
             )
-            child_goal_diag = self._target_goal_checks(scene_after, root_target_xy=root_target_xy)
-            child_goal_diag["solved_by_clearance"] = bool(child_metrics.blockers == 0)
-            child_goal_diag["wall_clear"] = bool(not child_goal_diag["wall_in_radius"])
-            child_metrics.solved = self._goal_satisfied(child_metrics, child_goal_diag)
 
             child_depth = node.depth + 1
             child_actions = []
@@ -960,19 +1007,16 @@ class StickPushRecedingHorizonSearch:
             child_actions_built = False
             if not child_metrics.solved and child_depth < self.cfg.max_depth:
                 if (not self.cfg.prune_target_invalid_nodes) or child_goal_diag["target_shift_ok"]:
-                    child_state_hash = hash_scene_state(scene_after)
                     t_child_action_gen_ns = time.perf_counter_ns()
                     child_actions, child_action_diag = self._build_node_actions(
                         scene_after,
                         state_hash=child_state_hash,
                         rng=rng,
+                        focus_object_names=list(child_goal_diag.get("primary_blocking_objects", [])),
+                        focus_meta=child_goal_diag,
                     )
                     child_action_generation_ms = _elapsed_ms(t_child_action_gen_ns)
                     child_actions_built = True
-                else:
-                    child_state_hash = hash_scene_state(scene_after)
-            else:
-                child_state_hash = hash_scene_state(scene_after)
 
             child_id = next_node_id
             next_node_id += 1
@@ -1021,7 +1065,7 @@ class StickPushRecedingHorizonSearch:
                         scene_before,
                         candidate_snapshot,
                         selected_action=executed_action,
-                        clearance_radius=self.cfg.sampling.clearance_radius,
+                        goal_overlay=scene_before_goal_diag,
                         max_candidates_drawn=self.cfg.visual.max_candidates_drawn,
                     ),
                 )
@@ -1031,7 +1075,7 @@ class StickPushRecedingHorizonSearch:
                         scene_before,
                         [executed_action],
                         selected_action=executed_action,
-                        clearance_radius=self.cfg.sampling.clearance_radius,
+                        goal_overlay=scene_before_goal_diag,
                         max_candidates_drawn=1,
                     ),
                 )
@@ -1266,6 +1310,11 @@ class StickPushRecedingHorizonSearch:
             },
             "root_metrics": serialize_metrics(root_metrics),
             "best_metrics": serialize_metrics(nodes[best_node_id].metrics),
+            "goal_labels": {
+                "active_label": str(self.cfg.grasp_success_active_label),
+                "root": dict(root_goal_diag.get("goal_labels", {})),
+                "root_active_success": bool(root_goal_diag.get("active_success", False)),
+            },
         }
         if timing_enabled and timing_summary is not None:
             summary["timing"] = timing_summary

@@ -3,11 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from taskbench.planners.stickpush_rh.config import SamplingConfig
-from taskbench.planners.stickpush_rh.geometry import (
-    point_in_front_semicircle,
-    point_segment_distance_xy,
-    within_shelf_xy,
-)
+from taskbench.planners.stickpush_rh.geometry import point_segment_distance_xy, within_shelf_xy
 from taskbench.planners.stickpush_rh.sampler import StickPushSampler
 from taskbench.planners.stickpush_rh.types import ObjectState, SceneState
 
@@ -39,10 +35,43 @@ def _scene_for_sampler() -> SceneState:
     )
 
 
+def _scene_with_two_blockers() -> SceneState:
+    target = ObjectState(
+        name="target",
+        center_xyz=np.array([0.60, 0.0, 0.41], dtype=np.float32),
+        radius=0.018,
+        is_target=True,
+        active=True,
+    )
+    blocker_0 = ObjectState(
+        name="b0",
+        center_xyz=np.array([0.50, -0.04, 0.41], dtype=np.float32),
+        radius=0.018,
+        is_target=False,
+        active=True,
+    )
+    blocker_1 = ObjectState(
+        name="b1",
+        center_xyz=np.array([0.50, 0.05, 0.41], dtype=np.float32),
+        radius=0.018,
+        is_target=False,
+        active=True,
+    )
+    return SceneState(
+        target=target,
+        blockers=[blocker_0, blocker_1],
+        all_objects=[target, blocker_0, blocker_1],
+        shelf_front_x=0.20,
+        shelf_back_x=0.90,
+        shelf_half_w=0.35,
+        surface_z=0.41,
+        open_dir_xy=np.array([-1.0, 0.0], dtype=np.float32),
+    )
+
+
 def test_sampler_grid_count_and_z_constant():
     scene = _scene_for_sampler()
     cfg = SamplingConfig(
-        clearance_radius=0.12,
         heading_degrees=(0, 45, 90, 135, 180, 225, 270, 315),
         x_approach_values=(0.04, 0.06, 0.08, 0.10),
         delta_len_fracs=(0.25, 0.50, 0.85),
@@ -62,6 +91,7 @@ def test_sampler_grid_count_and_z_constant():
         assert np.isclose(action.retract_xyz[2], z_expected)
         assert within_shelf_xy(action.entry_xyz[:2], scene, margin=cfg.world_min_clearance)
         assert within_shelf_xy(action.sweep_xyz[:2], scene, margin=cfg.world_min_clearance)
+        assert not bool(action.meta.get("is_target_push", False))
 
     # No multiplicative x_approach branching: each push geometry appears once.
     geom_keys = {
@@ -75,21 +105,10 @@ def test_sampler_grid_count_and_z_constant():
     }
     assert len(geom_keys) == len(actions)
 
-    # Non-target pushes must end outside target front semicircle clearance.
-    for action in actions:
-        assert not bool(action.meta.get("is_target_push", False))
-        assert not point_in_front_semicircle(
-            action.sweep_xyz[:2],
-            scene.target,
-            cfg.clearance_radius,
-            scene.open_dir_xy,
-        )
-
 
 def test_sampler_rejects_target_crossing_segments():
     scene = _scene_for_sampler()
     cfg = SamplingConfig(
-        clearance_radius=0.12,
         heading_degrees=(0, 45, 90, 135, 180, 225, 270, 315),
         x_approach_values=(0.04,),
         delta_len_fracs=(0.5,),
@@ -112,7 +131,6 @@ def test_sampler_rejects_target_crossing_segments():
 def test_sampler_includes_target_push_candidates():
     scene = _scene_for_sampler()
     cfg = SamplingConfig(
-        clearance_radius=0.12,
         heading_degrees=(0, 90, 180, 270),
         x_approach_values=(0.05,),
         delta_len_fracs=(0.5,),
@@ -137,7 +155,6 @@ def test_sampler_includes_target_push_candidates():
 def test_target_push_direction_topk_prunes_branches():
     scene = _scene_for_sampler()
     cfg = SamplingConfig(
-        clearance_radius=0.12,
         heading_degrees=(0, 90, 180, 270),
         delta_len_fracs=(0.5,),
         include_target_pushes=True,
@@ -153,3 +170,22 @@ def test_target_push_direction_topk_prunes_branches():
     dir_degs = {round(float(a.meta.get("target_push_dir_deg")), 5) for a in target_actions}
     # With one push length sample, number of target actions should match chosen top-K directions.
     assert len(dir_degs) <= 2
+
+
+def test_sampler_focus_object_names_filters_blocker_candidates():
+    scene = _scene_with_two_blockers()
+    cfg = SamplingConfig(
+        heading_degrees=(0, 90, 180, 270),
+        delta_len_fracs=(0.5,),
+        include_target_pushes=False,
+    )
+    sampler = StickPushSampler(cfg)
+
+    actions = sampler.sample_actions(scene, focus_object_names=["b1"])
+    assert actions
+    assert {a.blocker_name for a in actions} == {"b1"}
+
+    # Unknown focus falls back to sampling all active blockers.
+    fallback_actions = sampler.sample_actions(scene, focus_object_names=["does_not_exist"])
+    assert fallback_actions
+    assert {a.blocker_name for a in fallback_actions} == {"b0", "b1"}

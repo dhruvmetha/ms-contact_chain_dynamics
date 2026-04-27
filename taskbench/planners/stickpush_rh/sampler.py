@@ -8,10 +8,8 @@ import numpy as np
 
 from taskbench.planners.stickpush_rh.config import SamplingConfig
 from taskbench.planners.stickpush_rh.geometry import (
-    collect_blockers_in_clearance,
     normalize_xy,
     point_segment_distance_xy,
-    point_in_front_semicircle,
     ray_length_to_shelf_edge,
     rotate_xy,
     within_shelf_xy,
@@ -140,7 +138,7 @@ class StickPushSampler:
         v = float(self.cfg.target_push_open_dir_bias) * np.asarray(
             scene.open_dir_xy, dtype=np.float32
         )
-        wall_thresh = float(self.cfg.clearance_radius) + float(scene.target.radius)
+        wall_thresh = float(scene.target.radius) + 0.05
 
         # Wall repulsion: side walls (+/-Y) and back wall (+X). Front (-X) is open.
         d_pos_y = float(scene.shelf_half_w - t_xy[1])
@@ -175,12 +173,30 @@ class StickPushSampler:
             v = v + d / (dist * dist)
         return normalize_xy(v)
 
-    def sample_actions(self, scene: SceneState) -> list[PlannerAction]:
+    def sample_actions(
+        self,
+        scene: SceneState,
+        *,
+        focus_object_names: list[str] | None = None,
+        focus_meta: dict | None = None,
+    ) -> list[PlannerAction]:
         actions: list[PlannerAction] = []
-        blockers = collect_blockers_in_clearance(scene, self.cfg.clearance_radius)
-        sample_objects = list(blockers)
+        focus_set = (
+            {str(x) for x in focus_object_names if str(x)}
+            if focus_object_names is not None
+            else set()
+        )
+        blockers = [obj for obj in scene.blockers if obj.active]
+        if focus_set:
+            focused = [obj for obj in blockers if obj.name in focus_set]
+            sample_objects = focused if focused else list(blockers)
+        else:
+            sample_objects = list(blockers)
         if self.cfg.include_target_pushes and scene.target.active:
             sample_objects.append(scene.target)
+        focus_penetration = 0.0
+        if isinstance(focus_meta, dict):
+            focus_penetration = float(max(0.0, focus_meta.get("primary_penetration_sum", 0.0)))
 
         for obj in sample_objects:
             is_target_push = bool(obj.is_target)
@@ -267,9 +283,12 @@ class StickPushSampler:
                 if toward_target:
                     escape = max(
                         0.0,
-                        float(self.cfg.clearance_radius) + float(obj.radius) + float(self.cfg.contact_margin) - dist_bt,
+                        float(scene.target.radius)
+                        + float(obj.radius)
+                        + float(self.cfg.contact_margin)
+                        - dist_bt,
                     )
-                    base_push += escape
+                    base_push += escape + focus_penetration
                 base_push = min(base_push, l_cap)
 
                 for delta_len_idx, frac in enumerate(self.cfg.delta_len_fracs):
@@ -277,15 +296,6 @@ class StickPushSampler:
                     push_len = float(np.clip(push_len, self.cfg.min_push_len, l_cap))
                     p2_xy = p1_xy + u * push_len
                     if not within_shelf_xy(p2_xy, scene, margin=self.cfg.world_min_clearance):
-                        continue
-                    # For non-target pushes, require sweep endpoint to finish outside
-                    # the target grasp-clearance semicircle.
-                    if (not is_target_push) and point_in_front_semicircle(
-                        p2_xy,
-                        scene.target,
-                        self.cfg.clearance_radius,
-                        scene.open_dir_xy,
-                    ):
                         continue
                     if self.cfg.forbid_target_crossing and (not is_target_push):
                         target_clearance = (

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 
+import taskbench.planners.stickpush_rh.geometry as geometry
 from taskbench.planners.stickpush_rh.geometry import (
-    collect_blockers_in_clearance,
-    compute_node_metrics,
-    front_semicircle_wall_intersections,
-    front_semicircle_surface_intersects,
-    point_in_front_semicircle,
+    hash_scene_state,
+    point_segment_distance_xy,
+    ray_length_to_shelf_edge,
+    rotate_xy,
+    within_shelf_xy,
 )
 from taskbench.planners.stickpush_rh.types import ObjectState, SceneState
 
@@ -20,31 +21,17 @@ def _scene_for_geometry() -> SceneState:
         is_target=True,
         active=True,
     )
-    front_blocker = ObjectState(
-        name="b_front",
-        center_xyz=np.array([0.31, 0.0, 0.41], dtype=np.float32),
-        radius=0.018,
-        is_target=False,
-        active=True,
-    )
-    back_blocker = ObjectState(
-        name="b_back",
-        center_xyz=np.array([0.41, 0.0, 0.41], dtype=np.float32),
-        radius=0.018,
-        is_target=False,
-        active=True,
-    )
-    far_blocker = ObjectState(
-        name="b_far",
-        center_xyz=np.array([0.30, 0.08, 0.41], dtype=np.float32),
+    blocker = ObjectState(
+        name="b0",
+        center_xyz=np.array([0.40, 0.05, 0.41], dtype=np.float32),
         radius=0.018,
         is_target=False,
         active=True,
     )
     return SceneState(
         target=target,
-        blockers=[front_blocker, back_blocker, far_blocker],
-        all_objects=[target, front_blocker, back_blocker, far_blocker],
+        blockers=[blocker],
+        all_objects=[target, blocker],
         shelf_front_x=0.2,
         shelf_back_x=0.7,
         shelf_half_w=0.25,
@@ -53,83 +40,42 @@ def _scene_for_geometry() -> SceneState:
     )
 
 
-def test_front_semicircle_surface_intersection():
+def test_within_shelf_and_ray_length():
     scene = _scene_for_geometry()
-    target = scene.target
-    front, back, far = scene.blockers
+    p = np.array([0.40, 0.0], dtype=np.float32)
+    d = rotate_xy(np.array([1.0, 0.0], dtype=np.float32), 0.0)
 
-    assert front_semicircle_surface_intersects(front, target, 0.05, scene.open_dir_xy)
-    assert not front_semicircle_surface_intersects(back, target, 0.05, scene.open_dir_xy)
-    assert not front_semicircle_surface_intersects(far, target, 0.05, scene.open_dir_xy)
+    assert within_shelf_xy(p, scene)
+    ray_len = ray_length_to_shelf_edge(p, d, scene)
+    assert ray_len is not None
+    assert np.isclose(ray_len, scene.shelf_back_x - p[0], atol=1e-6)
 
 
-def test_metrics_include_surface_intersection():
+def test_point_segment_distance_xy_matches_expected_projection():
+    seg_a = np.array([0.0, 0.0], dtype=np.float32)
+    seg_b = np.array([2.0, 0.0], dtype=np.float32)
+    point = np.array([1.0, 0.3], dtype=np.float32)
+    assert np.isclose(point_segment_distance_xy(point, seg_a, seg_b), 0.3, atol=1e-6)
+
+
+def test_scene_hash_changes_with_object_motion():
     scene = _scene_for_geometry()
-    blockers = collect_blockers_in_clearance(scene, clearance_radius=0.05)
-    assert [b.name for b in blockers] == ["b_front"]
-
-    metrics = compute_node_metrics(scene, clearance_radius=0.05, pushes_used=3)
-    assert metrics.blockers == 1
-    assert metrics.pushes_used == 3
-    assert not metrics.solved
-    assert np.isclose(metrics.min_margin, 0.004, atol=1e-4)
-    # Deficit is measured from grasp semicircle center (target back-line midpoint).
-    assert np.isclose(metrics.deficit, 0.0100000017, atol=1e-4)
+    h0 = hash_scene_state(scene)
+    scene.blockers[0].center_xyz = scene.blockers[0].center_xyz + np.array([0.03, 0.0, 0.0], dtype=np.float32)
+    h1 = hash_scene_state(scene)
+    assert h0 != h1
 
 
-def test_point_in_front_semicircle():
-    scene = _scene_for_geometry()
-    target = scene.target
-    r = 0.05
-
-    # Front of target (toward opening, -X) and within radius.
-    p_front_inside = np.array([0.33, 0.0], dtype=np.float32)
-    # Back of target (+X) should not count even if within disk.
-    p_back_inside = np.array([0.39, 0.0], dtype=np.float32)
-    # Front but outside radius.
-    p_front_outside = np.array([0.29, 0.0], dtype=np.float32)
-
-    assert point_in_front_semicircle(
-        p_front_inside, target, r, scene.open_dir_xy
+def test_legacy_semicircle_helpers_removed_from_geometry_module():
+    removed_symbols = (
+        "grasp_semicircle_center_xy",
+        "point_in_front_semicircle",
+        "front_semicircle_surface_intersects",
+        "collect_blockers_in_clearance",
+        "compute_deficit",
+        "compute_node_metrics",
+        "segment_intersects_front_semicircle",
+        "front_semicircle_wall_intersections",
     )
-    assert not point_in_front_semicircle(
-        p_back_inside, target, r, scene.open_dir_xy
-    )
-    assert not point_in_front_semicircle(
-        p_front_outside, target, r, scene.open_dir_xy
-    )
-
-
-def _scene_for_wall_intersection_checks(target_xy: tuple[float, float]) -> SceneState:
-    target = ObjectState(
-        name="target",
-        center_xyz=np.array([target_xy[0], target_xy[1], 0.41], dtype=np.float32),
-        radius=0.018,
-        is_target=True,
-        active=True,
-    )
-    return SceneState(
-        target=target,
-        blockers=[],
-        all_objects=[target],
-        shelf_front_x=0.2,
-        shelf_back_x=0.45,
-        shelf_half_w=0.25,
-        surface_z=0.41,
-        open_dir_xy=np.array([-1.0, 0.0], dtype=np.float32),
-    )
-
-
-def test_front_semicircle_wall_intersections_ignore_back_wall_only_overlap():
-    # Back wall can be within clearance radius from grasp center, but should not
-    # fail if it lies behind the diameter line (not in front semicircle).
-    scene = _scene_for_wall_intersection_checks((0.34, 0.0))
-    hits = front_semicircle_wall_intersections(scene, clearance_radius=0.10)
-    assert hits == []
-
-
-def test_front_semicircle_wall_intersections_detect_side_wall_overlap():
-    # Positive side wall intersects the front semicircle at this y-offset.
-    scene = _scene_for_wall_intersection_checks((0.34, 0.20))
-    hits = front_semicircle_wall_intersections(scene, clearance_radius=0.10)
-    assert "side_pos" in hits
+    for symbol in removed_symbols:
+        assert not hasattr(geometry, symbol), f"legacy symbol should be removed: {symbol}"

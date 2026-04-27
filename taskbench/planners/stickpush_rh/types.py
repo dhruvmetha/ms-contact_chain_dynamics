@@ -15,6 +15,8 @@ class ObjectState:
     radius: float
     is_target: bool
     active: bool
+    footprint_type: str = "circle"
+    footprint_params: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -66,4 +68,3 @@ class SearchNode:
     untried_actions: list[PlannerAction] = field(default_factory=list)
     child_ids: list[int] = field(default_factory=list)
     state_hash: str = ""
-

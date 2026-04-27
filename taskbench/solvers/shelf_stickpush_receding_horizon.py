@@ -38,7 +38,6 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         max_depth: int = 256,
         parallel_frontier_enabled: bool = False,
         parallel_frontier_batch_size: int = 1,
-        clearance_radius: float = 0.10,
         heading_degrees: list[float] | None = None,
         x_approach_values: list[float] | None = None,
         insertion_approach_backoff: float = 0.07,
@@ -69,6 +68,18 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         target_wall_margin: float = 0.01,
         prune_target_invalid_nodes: bool = False,
         require_target_shift_limit_for_success: bool = False,
+        grasp_success_active_label: str = "any",
+        grasp_success_templates_straight_deg: list[float] | None = None,
+        grasp_success_templates_any_deg: list[float] | None = None,
+        grasp_success_grid_resolution: float = 0.003,
+        grasp_success_front_outside_offset: float = 0.06,
+        grasp_success_finger_thickness: float = 0.012,
+        grasp_success_finger_length: float = 0.05,
+        grasp_success_jaw_open: float = 0.06,
+        grasp_success_jaw_contact: float = 0.036,
+        grasp_success_contact_pad_width: float = 0.01,
+        grasp_success_contact_pad_depth: float = 0.01,
+        grasp_success_collision_epsilon: float = 0.0,
         ucb_exploration_c: float = 1.2,
         ucb_untried_bonus: float = 1.0,
         ucb_solved_bonus: float = 10.0,
@@ -93,7 +104,6 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         self.max_depth = int(max_depth)
         self.parallel_frontier_enabled = bool(parallel_frontier_enabled)
         self.parallel_frontier_batch_size = max(1, int(parallel_frontier_batch_size))
-        self.clearance_radius = float(clearance_radius)
         self.heading_degrees = heading_degrees
         self.x_approach_values = x_approach_values
         self.insertion_approach_backoff = float(insertion_approach_backoff)
@@ -128,6 +138,26 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
         self.target_wall_margin = float(target_wall_margin)
         self.prune_target_invalid_nodes = bool(prune_target_invalid_nodes)
         self.require_target_shift_limit_for_success = bool(require_target_shift_limit_for_success)
+        self.grasp_success_active_label = str(grasp_success_active_label)
+        self.grasp_success_templates_straight_deg = (
+            list(grasp_success_templates_straight_deg)
+            if grasp_success_templates_straight_deg is not None
+            else list(RecedingHorizonConfig().grasp_success_templates_straight_deg)
+        )
+        self.grasp_success_templates_any_deg = (
+            list(grasp_success_templates_any_deg)
+            if grasp_success_templates_any_deg is not None
+            else list(RecedingHorizonConfig().grasp_success_templates_any_deg)
+        )
+        self.grasp_success_grid_resolution = float(grasp_success_grid_resolution)
+        self.grasp_success_front_outside_offset = float(grasp_success_front_outside_offset)
+        self.grasp_success_finger_thickness = float(grasp_success_finger_thickness)
+        self.grasp_success_finger_length = float(grasp_success_finger_length)
+        self.grasp_success_jaw_open = float(grasp_success_jaw_open)
+        self.grasp_success_jaw_contact = float(grasp_success_jaw_contact)
+        self.grasp_success_contact_pad_width = float(grasp_success_contact_pad_width)
+        self.grasp_success_contact_pad_depth = float(grasp_success_contact_pad_depth)
+        self.grasp_success_collision_epsilon = float(grasp_success_collision_epsilon)
         self.ucb_exploration_c = float(ucb_exploration_c)
         self.ucb_untried_bonus = float(ucb_untried_bonus)
         self.ucb_solved_bonus = float(ucb_solved_bonus)
@@ -157,7 +187,6 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
             approach_backoff = float(self.x_approach_values[0])
 
         sampling = SamplingConfig(
-            clearance_radius=self.clearance_radius,
             heading_degrees=tuple(self.heading_degrees) if self.heading_degrees is not None else SamplingConfig().heading_degrees,
             x_approach_values=tuple(self.x_approach_values) if self.x_approach_values is not None else SamplingConfig().x_approach_values,
             insertion_approach_backoff=approach_backoff,
@@ -207,6 +236,18 @@ class ShelfStickPushRecedingHorizonSolver(BaseSolver):
             target_wall_margin=self.target_wall_margin,
             prune_target_invalid_nodes=self.prune_target_invalid_nodes,
             require_target_shift_limit_for_success=self.require_target_shift_limit_for_success,
+            grasp_success_active_label=self.grasp_success_active_label,
+            grasp_success_templates_straight_deg=tuple(self.grasp_success_templates_straight_deg),
+            grasp_success_templates_any_deg=tuple(self.grasp_success_templates_any_deg),
+            grasp_success_grid_resolution=self.grasp_success_grid_resolution,
+            grasp_success_front_outside_offset=self.grasp_success_front_outside_offset,
+            grasp_success_finger_thickness=self.grasp_success_finger_thickness,
+            grasp_success_finger_length=self.grasp_success_finger_length,
+            grasp_success_jaw_open=self.grasp_success_jaw_open,
+            grasp_success_jaw_contact=self.grasp_success_jaw_contact,
+            grasp_success_contact_pad_width=self.grasp_success_contact_pad_width,
+            grasp_success_contact_pad_depth=self.grasp_success_contact_pad_depth,
+            grasp_success_collision_epsilon=self.grasp_success_collision_epsilon,
             sampling=sampling,
             ucb=ucb,
             visual=visual,

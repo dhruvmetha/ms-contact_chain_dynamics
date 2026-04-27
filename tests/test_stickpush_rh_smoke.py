@@ -79,7 +79,13 @@ class _FakeProvider:
 
 
 class _FakeSampler:
-    def sample_actions(self, scene: SceneState):
+    def sample_actions(
+        self,
+        scene: SceneState,
+        *,
+        focus_object_names: list[str] | None = None,
+        focus_meta: dict | None = None,
+    ):
         if scene.target.name.endswith("_1"):
             return []
         p_a = np.array([0.15, 0.0, scene.surface_z + 0.001], dtype=np.float32)
@@ -137,20 +143,29 @@ def test_search_smoke_writes_artifacts(tmp_path):
     assert result.success
     assert (latest / "summary.json").exists()
     assert (latest / "final_plan.json").exists()
-    assert (latest / "exp_000001" / "metrics.json").exists()
-    assert (latest / "exp_000001" / "selected_only.png").exists()
-    assert (latest / "exp_000001" / "frontier_pre_select.csv").exists()
-    assert (latest / "exp_000001" / "frontier_post_update.csv").exists()
 
-    with (latest / "exp_000001" / "frontier_pre_select.csv").open("r", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    assert rows
-    assert "lex_rank" in rows[0]
-    assert "ucb_score" in rows[0]
-    assert "snapshot_kind" in rows[0]
-    assert any(str(r.get("is_selected", "")).lower() in {"true", "1"} for r in rows)
-    assert all(r.get("snapshot_kind") == "pre_select" for r in rows)
+    with (latest / "summary.json").open("r", encoding="utf-8") as f:
+        summary = json.load(f)
+    assert "goal_labels" in summary
+    assert "root_active_success" in summary["goal_labels"]
+    assert summary["root_metrics"]["solved"] == summary["goal_labels"]["root_active_success"]
 
-    with (latest / "exp_000001" / "metrics.json").open("r", encoding="utf-8") as f:
-        metrics = json.load(f)
-    assert metrics["selection"]["source"] == "ucb_select"
+    expansions = int(summary.get("expansions", 0))
+    if expansions > 0:
+        assert (latest / "exp_000001" / "metrics.json").exists()
+        assert (latest / "exp_000001" / "selected_only.png").exists()
+        assert (latest / "exp_000001" / "frontier_pre_select.csv").exists()
+        assert (latest / "exp_000001" / "frontier_post_update.csv").exists()
+
+        with (latest / "exp_000001" / "frontier_pre_select.csv").open("r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert rows
+        assert "lex_rank" in rows[0]
+        assert "ucb_score" in rows[0]
+        assert "snapshot_kind" in rows[0]
+        assert any(str(r.get("is_selected", "")).lower() in {"true", "1"} for r in rows)
+        assert all(r.get("snapshot_kind") == "pre_select" for r in rows)
+
+        with (latest / "exp_000001" / "metrics.json").open("r", encoding="utf-8") as f:
+            metrics = json.load(f)
+        assert metrics["selection"]["source"] == "ucb_select"

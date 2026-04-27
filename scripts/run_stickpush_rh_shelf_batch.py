@@ -56,7 +56,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-seed", type=int, default=20000)
     parser.add_argument("--max-executions", type=int, default=1000)
     parser.add_argument("--max-depth", type=int, default=256)
-    parser.add_argument("--clearance-radius", type=float, default=0.10)
     parser.add_argument("--visual-save-images", action="store_true")
     parser.add_argument("--visual-save-frontier-csv", action="store_true")
     parser.add_argument(
@@ -102,7 +101,6 @@ def main() -> None:
     solver = ShelfStickPushRecedingHorizonSolver(
         max_executions=int(args.max_executions),
         max_depth=int(args.max_depth),
-        clearance_radius=float(args.clearance_radius),
         visual_save_images=bool(args.visual_save_images),
         visual_save_frontier_csv=bool(args.visual_save_frontier_csv),
         artifact_root=str(tmp_root),
@@ -151,7 +149,8 @@ def main() -> None:
             summary = _load_json(summary_path)
 
             root_metrics = summary.get("root_metrics", {})
-            root_solved = bool(root_metrics.get("solved", False))
+            goal_labels = summary.get("goal_labels", {})
+            root_solved = bool(goal_labels.get("root_active_success", root_metrics.get("solved", False)))
             executions = int(summary.get("executions", result.elapsed_steps))
 
             row = {
@@ -162,6 +161,7 @@ def main() -> None:
                 "executions": executions,
                 "solve_depth": summary.get("solve_depth"),
                 "root_metrics": root_metrics,
+                "goal_labels": goal_labels,
                 "best_metrics": summary.get("best_metrics"),
             }
 
@@ -200,7 +200,6 @@ def main() -> None:
                 "max_seed": int(args.max_seed),
                 "max_executions": int(args.max_executions),
                 "max_depth": int(args.max_depth),
-                "clearance_radius": float(args.clearance_radius),
                 "num_objects": int(args.num_objects),
                 "visual_save_images": bool(args.visual_save_images),
                 "visual_save_frontier_csv": bool(args.visual_save_frontier_csv),

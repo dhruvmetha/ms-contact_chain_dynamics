@@ -7,7 +7,6 @@ run:
     max_depth: 256
     parallel_frontier_enabled: false
     parallel_frontier_batch_size: 4
-    clearance_radius: 0.10
     heading_degrees: [0, 45, 90, 135, 180, 225, 270, 315]
     x_approach_values: [0.07]
     insertion_approach_backoff: 0.07
@@ -38,6 +37,18 @@ run:
     target_wall_margin: 0.01
     prune_target_invalid_nodes: false
     require_target_shift_limit_for_success: false
+    grasp_success_active_label: any
+    grasp_success_templates_straight_deg: [0]
+    grasp_success_templates_any_deg: [0, -20, 20, -40, 40]
+    grasp_success_grid_resolution: 0.003
+    grasp_success_front_outside_offset: 0.06
+    grasp_success_finger_thickness: 0.012
+    grasp_success_finger_length: 0.05
+    grasp_success_jaw_open: 0.06
+    grasp_success_jaw_contact: 0.036
+    grasp_success_contact_pad_width: 0.01
+    grasp_success_contact_pad_depth: 0.01
+    grasp_success_collision_epsilon: 0.0
     ucb_exploration_c: 1.2
     ucb_untried_bonus: 1.0
     ucb_solved_bonus: 10.0
